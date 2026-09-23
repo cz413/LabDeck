@@ -41,6 +41,7 @@
   "build": {
     "appId": "cn.lab.server-manager",
     "productName": "LabDeck",
+    "electronDist": "node_modules/electron/dist",
     "npmRebuild": false,
     "directories": {
       "output": "release"
