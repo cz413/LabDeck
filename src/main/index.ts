@@ -67,7 +67,7 @@ function createTray(): void {
   tray.setContextMenu(Menu.buildFromTemplate([
     { label: '显示 LabDeck', click: showMainWindow },
     { type: 'separator' },
-    { label: '退出 LabDeck', click: () => app.quit() }
+    { label: '退出 LabDeck（前台任务可能中断）', click: () => app.quit() }
   ]))
   tray.on('double-click', showMainWindow)
 }

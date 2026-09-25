@@ -1,6 +1,6 @@
 {
   "name": "lab-server-manager",
-  "version": "0.6.8",
+  "version": "0.6.13",
   "description": "本地优先的实验室服务器管理桌面应用",
   "main": "out/main/index.js",
   "author": "Lab Server Manager",

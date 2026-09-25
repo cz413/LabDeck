@@ -163,6 +163,8 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
     }
     containerRef.current!.addEventListener('contextmenu', handleContextMenu)
     const resizeObserver = new ResizeObserver(() => {
+      const container = containerRef.current
+      if (!container || container.clientWidth === 0 || container.clientHeight === 0) return
       fit.fit()
       if (sessionRef.current) window.labApi.terminal.resize(sessionRef.current, terminal.cols, terminal.rows)
       const panel = panelRef.current
@@ -261,6 +263,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
 
   const reconnect = (): void => {
     if (!terminalRef.current) return
+    if (!isLocal && status === 'online' && !window.confirm('重新连接会先断开当前 SSH，会中断正在运行的前台命令。确定继续吗？')) return
     if (sessionRef.current) window.labApi.terminal.close(sessionRef.current)
     sessionRef.current = null
     canAutofillPasswordRef.current = false

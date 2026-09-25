@@ -1021,15 +1021,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .server-detail-actions { display: flex; align-items: center; gap: 6px; }
 .server-detail-actions button { height: 32px; display: inline-flex; align-items: center; gap: 6px; padding: 0 10px; color: var(--text); background: var(--control-bg); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; font-size: 9px; }
 .server-detail-actions button:hover { background: var(--control-hover); border-color: var(--interactive-border); }
+.server-detail-route { display: flex; align-items: center; }
+.server-detail-actions .server-detail-terminal { color: var(--accent-text); background: var(--accent-surface); border-color: var(--accent-text); font-weight: 650; }
+.server-detail-actions .server-detail-terminal:hover { background: var(--surface-active); border-color: var(--accent-text); }
 .server-detail-actions .server-detail-vscode { color: #9bd2f3; background: var(--accent-surface); }
 .server-detail-actions button:disabled { opacity: .58; cursor: wait; }
 .server-vscode-icon { color: #9bd2f3 !important; }
-
-.server-detail-tabs { height: 41px; flex: 0 0 41px; display: flex; align-items: stretch; gap: 1px; padding: 0 12px; background: var(--surface-subtle); border-bottom: 1px solid var(--separator); }
-.server-detail-tabs button { position: relative; min-width: 92px; display: inline-flex; align-items: center; justify-content: center; gap: 7px; color: var(--muted); background: transparent; border: 0; cursor: pointer; font-size: 10px; }
-.server-detail-tabs button:hover { color: var(--icon-hover); }
-.server-detail-tabs button.active { color: var(--text); }
-.server-detail-tabs button.active::after { position: absolute; content: ''; left: 14px; right: 14px; bottom: -1px; height: 2px; background: var(--accent-text); }
 .server-detail-panel { min-width: 0; min-height: 0; flex: 1; display: none; }
 .server-detail-panel.active { display: block; }
 .server-detail-panel.overview { overflow: auto; padding: 16px; }
@@ -1255,8 +1252,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .server-detail-identity h2 { font-size: 17px; }
 .server-detail-identity p { font-size: 10px; }
 .server-detail-status { font-size: 9px; }
-.server-detail-actions button,
-.server-detail-tabs button { font-size: 11px; }
+.server-detail-actions button { font-size: 11px; }
 .server-detail-metric > div span { font-size: 10px; }
 .server-detail-metric > div strong { font-size: 17px; }
 .server-detail-metric p { font-size: 9px; }
@@ -1353,7 +1349,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   border-bottom: 1px solid var(--separator);
 }
 .server-detail-commandbar .server-detail-back { align-self: center; }
-.server-detail-commandbar .server-detail-tabs { height: 54px; flex: 0 0 auto; padding: 0; background: transparent; border: 0; }
 .server-detail-commandbar .server-detail-actions { margin-left: auto; }
 .server-detail-panel.overview { padding: 18px 24px 24px; }
 .server-terminal-tabbar { height: 42px; flex-basis: 42px; background: var(--surface-raised); }
@@ -1379,35 +1374,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 :root[data-theme="instrument"] .server-terminal-tabbar { background: var(--surface-subtle); }
 :root[data-theme="instrument"] .terminal-clipboard-notice { color: #195d43; background: #dcf0e7; border-color: #a6d2bd; }
 
-/* V0.5.8 — two-level server navigation: page tabs, then SSH sessions */
+/* Server details are a single overview surface; SSH sessions live in the shared terminal page. */
 .server-detail-commandbar {
   position: relative;
   z-index: 2;
   align-items: center;
 }
-.server-detail-page.terminal-mode .server-detail-commandbar { background: var(--surface-subtle); }
-.server-detail-commandbar .server-detail-tabs {
-  height: 36px;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 2px;
-  padding: 2px;
-  background: var(--control-bg);
-  border: 1px solid var(--border);
-  border-radius: 5px;
-}
-.server-detail-commandbar .server-detail-tabs button {
-  min-width: 88px;
-  height: 30px;
-  border-radius: 3px;
-}
-.server-detail-commandbar .server-detail-tabs button:hover { background: var(--control-hover); }
-.server-detail-commandbar .server-detail-tabs button.active {
-  color: var(--text);
-  background: var(--surface-active);
-  box-shadow: inset 0 0 0 1px var(--interactive-border);
-}
-.server-detail-commandbar .server-detail-tabs button.active::after { display: none; }
 .server-terminal-workspace { position: relative; overflow: visible; }
 .server-terminal-workspace .terminal-panel.embedded { overflow: visible; }
 .server-terminal-workspace .terminal-container { overflow: hidden; }
@@ -1416,10 +1388,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   z-index: 3;
   height: 46px;
   flex-basis: 46px;
-  padding: 0 184px 0 12px;
+  padding: 0 12px;
   background: var(--surface-raised);
   border-bottom: 1px solid var(--separator);
 }
+.server-terminal-workspace .server-terminal-tabbar.no-sessions { padding-right: 12px; }
+.persistent-terminal-workspace .server-terminal-tabbar.no-sessions .local-terminal-tabs { flex: 0 0 0; width: 0; overflow: hidden; }
 .server-terminal-workspace .local-terminal-tab {
   min-width: 112px;
   height: 46px;
@@ -1433,24 +1407,80 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   box-shadow: inset 0 -2px var(--accent-text);
 }
 .server-terminal-workspace .local-terminal-add { height: 46px; border: 0; }
-.server-terminal-workspace .local-terminal-stage { overflow: visible; }
-.server-terminal-workspace .terminal-panel.embedded .workspace-toolbar {
-  position: absolute;
-  top: -46px;
-  right: 16px;
-  z-index: 5;
-  width: auto;
-  height: 46px;
+.server-terminal-session-actions { position: relative; display: flex; align-items: center; gap: 8px; }
+.server-terminal-workspace .server-terminal-add {
+  width: 36px;
+  height: 34px;
+  justify-content: center;
   padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.server-terminal-workspace .server-terminal-file {
+  height: 34px;
+  gap: 7px;
+  padding: 0 10px;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+}
+.server-terminal-workspace .server-terminal-add:disabled { opacity: .45; cursor: not-allowed; }
+.server-terminal-workspace .server-terminal-file:disabled { opacity: .45; cursor: not-allowed; }
+.ssh-server-picker {
+  position: absolute;
+  top: calc(100% + 7px);
+  right: 0;
+  z-index: 8;
+  width: 320px;
+  max-width: calc(100vw - 32px);
+  max-height: min(420px, calc(100vh - 130px));
+  overflow: auto;
+  padding: 6px;
+  color: var(--text);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  box-shadow: 0 14px 36px rgba(0, 0, 0, .32);
+}
+.ssh-server-picker-heading { display: block; padding: 9px 10px 8px; color: var(--muted); font-size: 10px; }
+.ssh-server-choice {
+  width: 100%;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  color: var(--text);
+  text-align: left;
   background: transparent;
   border: 0;
+  border-radius: 4px;
+  cursor: pointer;
 }
-.server-terminal-workspace .terminal-panel.embedded .toolbar-button { height: 32px; }
+.ssh-server-choice:hover, .ssh-server-choice:focus-visible { background: var(--surface-hover); outline: none; }
+.ssh-server-choice > svg { flex: 0 0 auto; color: var(--accent-text); }
+.ssh-server-choice-copy { min-width: 0; display: grid; gap: 4px; }
+.ssh-server-choice-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.ssh-server-choice-copy small { overflow: hidden; color: var(--muted); text-overflow: ellipsis; white-space: nowrap; font: 9px Consolas, monospace; }
+.server-terminal-workspace .local-terminal-stage { overflow: visible; }
+.server-terminal-workspace .terminal-panel.embedded .workspace-toolbar {
+  position: relative;
+  top: auto;
+  right: auto;
+  z-index: auto;
+  width: 100%;
+  height: 42px;
+  flex-basis: 42px;
+  padding: 0 16px;
+  background: #07101d;
+  border: 0;
+  border-bottom: 1px solid #1a3044;
+}
+.server-terminal-workspace .terminal-panel.embedded .toolbar-button { height: 32px; padding: 0 9px; }
 
 @media (max-width: 1180px) {
-  .server-terminal-workspace .server-terminal-tabbar { padding-right: 172px; }
+  .server-terminal-workspace .server-terminal-tabbar { padding-right: 12px; }
   .server-terminal-workspace .local-terminal-tab { min-width: 96px; }
-  .server-terminal-workspace .terminal-panel.embedded .workspace-toolbar { right: 12px; }
   .server-terminal-workspace .terminal-clipboard-button { min-width: 58px; padding: 0 8px; }
 }
 
@@ -1464,6 +1494,36 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   overflow: hidden;
   background: var(--border-soft);
   border-radius: 5px;
+}
+
+/* Persistent SSH sessions stay mounted while the user visits other pages. */
+.page-content.ssh-terminal-page {
+  display: flex;
+  min-height: 0;
+  overflow: hidden;
+  padding: 16px 20px 20px;
+}
+
+.persistent-terminal-workspace { display: none; }
+.persistent-terminal-workspace.visible {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  flex: 1;
+}
+
+.persistent-terminal-workspace .local-terminal-tabs { flex: 1; }
+.persistent-terminal-workspace .local-terminal-tab { min-width: 152px; }
+.persistent-terminal-workspace .local-terminal-stage { overflow: hidden; }
+.persistent-terminal-workspace .local-terminal-view.active { display: flex; }
+.persistent-terminal-workspace .local-terminal-view:not(.active) { display: none; }
+.persistent-terminal-workspace .terminal-panel.embedded .terminal-container { overflow: hidden; }
+
+@media (max-width: 780px) {
+  .page-content.ssh-terminal-page { padding: 10px; }
+  .persistent-terminal-workspace .server-terminal-tabbar { padding-right: 12px; }
+  .persistent-terminal-workspace .local-terminal-tab { min-width: 126px; }
 }
 .gpu-recommendation-intro {
   min-width: 0;

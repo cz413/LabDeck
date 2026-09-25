@@ -1,4 +1,3 @@
-import { useEffect, useState } from 'react'
 import {
   Activity,
   Code2,
@@ -17,16 +16,12 @@ import {
 import { gpuLoadState, gpuMemoryPercent, isGpuBusy } from '@shared/gpu-status'
 import type { ServerProfile, ServerSnapshot } from '@shared/types'
 import { AccessRouteSelect } from './AccessRouteSelect'
-import { ServerTerminalWorkspace } from './ServerTerminalWorkspace'
-
-export type ServerDetailTab = 'overview' | 'terminal'
 
 interface ServerDetailPageProps {
   server: ServerProfile
   snapshot?: ServerSnapshot
-  tab: ServerDetailTab
   refreshing: boolean
-  onTabChange(tab: ServerDetailTab): void
+  onTerminal(): void
   onRefresh(): void
   accessRouteId: string
   onAccessRouteChange(routeId: string): void
@@ -35,7 +30,6 @@ interface ServerDetailPageProps {
   vscodeConnecting: boolean
   onEdit(): void
   onGpu(gpuIndex: number): void
-  onTrusted(): Promise<void>
 }
 
 const percent = (value: number | null | undefined): string => value === null || value === undefined ? '—' : `${Math.round(value)}%`
@@ -52,8 +46,7 @@ const uptime = (seconds: number | null | undefined): string => {
 }
 
 export function ServerDetailPage(props: ServerDetailPageProps): React.JSX.Element {
-  const { server, snapshot, tab } = props
-  const [terminalStarted, setTerminalStarted] = useState(tab === 'terminal')
+  const { server, snapshot } = props
   const memoryPercent = snapshot?.memoryTotalBytes && snapshot.memoryUsedBytes !== null
     ? snapshot.memoryUsedBytes / snapshot.memoryTotalBytes * 100
     : null
@@ -61,27 +54,22 @@ export function ServerDetailPage(props: ServerDetailPageProps): React.JSX.Elemen
   const gpus = snapshot?.gpus ?? []
   const busyGpuCount = gpus.filter(isGpuBusy).length
 
-  useEffect(() => {
-    if (tab === 'terminal') setTerminalStarted(true)
-  }, [tab])
-
   return (
-    <section className={`server-detail-page ${tab === 'terminal' ? 'terminal-mode' : 'overview-mode'}`}>
+    <section className="server-detail-page">
       <header className="server-detail-commandbar">
-        <nav className="server-detail-tabs" role="tablist" aria-label="服务器详情页面">
-          <button type="button" role="tab" aria-selected={tab === 'overview'} className={tab === 'overview' ? 'active' : ''} onClick={() => props.onTabChange('overview')}><Activity size={15} />总览</button>
-          <button type="button" role="tab" aria-selected={tab === 'terminal'} className={tab === 'terminal' ? 'active' : ''} onClick={() => props.onTabChange('terminal')}><SquareTerminal size={15} />终端</button>
-        </nav>
-        <div className="server-detail-actions">
+        <div className="server-detail-route">
           <AccessRouteSelect server={server} value={props.accessRouteId} onChange={props.onAccessRouteChange} />
+        </div>
+        <div className="server-detail-actions">
           <button type="button" onClick={props.onRefresh}><RefreshCw size={15} className={props.refreshing ? 'spin' : ''} />刷新</button>
+          <button type="button" className="server-detail-terminal" onClick={props.onTerminal}><SquareTerminal size={15} />SSH 终端</button>
           <button type="button" onClick={props.onSftp}><FolderOpen size={15} />文件</button>
           <button type="button" className="server-detail-vscode" onClick={props.onVsCode} disabled={props.vscodeConnecting}><Code2 size={15} />{props.vscodeConnecting ? '连接中…' : 'VS Code'}</button>
           <button type="button" onClick={props.onEdit}><Edit3 size={15} />编辑</button>
         </div>
       </header>
 
-      <div className={`server-detail-panel overview ${tab === 'overview' ? 'active' : ''}`}>
+      <div className="server-detail-panel overview active">
         {snapshot?.status === 'offline' && !snapshot.cached ? (
           <div className="server-detail-offline"><WifiOff size={28} /><div><strong>无法连接这台服务器</strong><span>{snapshot.error ?? '检查网络、端口转发或 SSH 配置后重试。'}</span></div></div>
         ) : (
@@ -129,9 +117,6 @@ export function ServerDetailPage(props: ServerDetailPageProps): React.JSX.Elemen
         )}
       </div>
 
-      {terminalStarted && <div className={`server-detail-panel terminal ${tab === 'terminal' ? 'active' : ''}`}>
-        <ServerTerminalWorkspace server={server} accessRouteId={props.accessRouteId} onTrusted={props.onTrusted} />
-      </div>}
     </section>
   )
 }
