@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { FolderOpen, Plus, Server, SquareTerminal, X } from 'lucide-react'
+import { Code2, FolderOpen, Plus, Server, SquareTerminal, X } from 'lucide-react'
 import type { ServerProfile } from '@shared/types'
 import { getAccessRoute } from '@shared/access-routes'
 import { TerminalPanel } from './TerminalPanel'
@@ -20,6 +20,8 @@ interface ServerTerminalWorkspaceProps {
   onActivate(sessionId: string): void
   onAdd(server: ServerProfile): void
   onClose(sessionId: string): void
+  onOpenVsCode(server: ServerProfile, accessRouteId: string): void
+  vscodeConnectingId: string | null
   onOpenFiles(session: ServerTerminalSession): void
   onOpenServerFiles(server: ServerProfile): void
   onTrusted(): Promise<void>
@@ -34,6 +36,8 @@ export function ServerTerminalWorkspace({
   onActivate,
   onAdd,
   onClose,
+  onOpenVsCode,
+  vscodeConnectingId,
   onOpenFiles,
   onOpenServerFiles,
   onTrusted
@@ -129,6 +133,19 @@ export function ServerTerminalWorkspace({
           >
             <Plus size={17} />
           </button>
+          {activeSession && (
+            <button
+              type="button"
+              className="local-terminal-add server-terminal-vscode"
+              onClick={() => onOpenVsCode(activeSession.server, activeSession.accessRouteId)}
+              disabled={vscodeConnectingId === activeSession.server.id}
+              title={vscodeConnectingId === activeSession.server.id ? 'VS Code 连接中' : '用 VS Code 打开当前 SSH 连接'}
+              aria-label={vscodeConnectingId === activeSession.server.id ? 'VS Code 连接中' : '用 VS Code 打开当前 SSH 连接'}
+            >
+              <Code2 size={15} />
+              <span>{vscodeConnectingId === activeSession.server.id ? '连接中…' : 'VS Code'}</span>
+            </button>
+          )}
           <button
             ref={filesButtonRef}
             type="button"

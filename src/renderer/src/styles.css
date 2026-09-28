@@ -1424,8 +1424,20 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   border: 1px solid var(--border);
   border-radius: 5px;
 }
+.server-terminal-workspace .server-terminal-vscode {
+  height: 34px;
+  gap: 7px;
+  padding: 0 10px;
+  color: var(--accent-text);
+  background: var(--accent-surface);
+  border: 1px solid var(--interactive-border);
+  border-radius: 5px;
+}
+.server-terminal-workspace .server-terminal-vscode:hover { background: var(--surface-hover); border-color: var(--accent-text); }
+.server-terminal-workspace .server-terminal-vscode:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 2px; }
 .server-terminal-workspace .server-terminal-add:disabled { opacity: .45; cursor: not-allowed; }
 .server-terminal-workspace .server-terminal-file:disabled { opacity: .45; cursor: not-allowed; }
+.server-terminal-workspace .server-terminal-vscode:disabled { opacity: .55; cursor: wait; }
 .ssh-server-picker {
   position: absolute;
   top: calc(100% + 7px);

@@ -361,11 +361,11 @@ export function App(): React.JSX.Element {
     })
   }
 
-  const openVsCode = async (server: ServerProfile): Promise<void> => {
+  const openVsCode = async (server: ServerProfile, accessRouteId = accessRouteIdFor(server)): Promise<void> => {
     if (vscodeConnectingId === server.id) return
     setVsCodeConnectingId(server.id)
     try {
-      const result = await window.labApi.vscode.openRemote(server.id, accessRouteIdFor(server))
+      const result = await window.labApi.vscode.openRemote(server.id, accessRouteId)
       notify(result.message)
     } catch (error) {
       notify(error instanceof Error ? error.message : '无法打开 VS Code 远程连接', 'error')
@@ -659,6 +659,8 @@ export function App(): React.JSX.Element {
             onActivate={setActiveTerminalSessionId}
             onAdd={addTerminalSession}
             onClose={closeTerminalSession}
+            onOpenVsCode={(server, accessRouteId) => void openVsCode(server, accessRouteId)}
+            vscodeConnectingId={vscodeConnectingId}
             onOpenFiles={(session) => {
               const server = servers.find((item) => item.id === session.server.id) ?? session.server
               openSftp(server, session.accessRouteId)
