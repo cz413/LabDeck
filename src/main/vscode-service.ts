@@ -12,11 +12,11 @@ const launchCooldownMs = 20_000
 const launchingTargets = new Map<string, number>()
 
 const powershellFocusScript = String.raw`
-$aliasName = $args[0]
+$aliasPattern = (($args | Where-Object { $_ }) | ForEach-Object { [regex]::Escape("[SSH: $_]") }) -join '|'
 $target = Get-Process -ErrorAction SilentlyContinue | Where-Object {
   ($_.ProcessName -eq 'Code' -or $_.ProcessName -eq 'Code - Insiders') -and
   $_.MainWindowHandle -ne 0 -and
-  $_.MainWindowTitle -match [regex]::Escape("[SSH: $aliasName]")
+  $_.MainWindowTitle -match $aliasPattern
 } | Select-Object -First 1
 if (-not $target) { exit 3 }
 Add-Type @'
@@ -32,12 +32,21 @@ public static class LabDeckWindow {
 exit 0
 `
 
-export function vscodeSshAlias(serverId: string): string {
-  return `labdeck-${serverId.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`
+export function vscodeSshAlias(serverId: string, serverName?: string): string {
+  // Keep the old UUID alias available to callers that need to identify
+  // windows opened by earlier app versions.
+  if (!serverName) return `labdeck-${serverId.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`
+
+  const normalizedName = serverName.normalize('NFKC').trim().toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '')
+  const shortName = Array.from(normalizedName).slice(0, 20).join('') || 'server'
+  const shortId = serverId.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 6) || 'host'
+  return `labdeck-${shortName}-${shortId}`
 }
 
-export function vscodeRouteSshAlias(serverId: string, accessRouteId?: string): string {
-  const base = vscodeSshAlias(serverId)
+export function vscodeRouteSshAlias(serverId: string, accessRouteId?: string, serverName?: string): string {
+  const base = vscodeSshAlias(serverId, serverName)
   if (!accessRouteId || accessRouteId === 'direct') return base
   return `${base}-${accessRouteId.toLowerCase().replace(/[^a-z0-9-]/g, '-')}`
 }
@@ -98,14 +107,14 @@ export function renderManagedSshConfig(servers: ServerProfile[]): string {
     // edited profiles use explicit route aliases below and can expose both
     // paths without overwriting each other.
     if (!server.accessRoutes?.length && server.jumpHost) {
-      const alias = vscodeSshAlias(server.id)
+      const alias = vscodeSshAlias(server.id, server.name)
       const jumpAlias = `${alias}-jump`
       lines.push(...renderHost(jumpAlias, server.jumpHost), '')
       lines.push(...renderHost(alias, server, jumpAlias), '')
       continue
     }
     for (const route of getAccessRoutes(server)) {
-      const alias = vscodeRouteSshAlias(server.id, route.id)
+      const alias = vscodeRouteSshAlias(server.id, route.id, server.name)
       if (route.kind === 'jump' && route.jumpHost) {
         const jumpAlias = `${alias}-jump`
         lines.push(...renderHost(jumpAlias, route.jumpHost), '')
@@ -131,8 +140,13 @@ export class VsCodeService {
 
     const routeId = accessRouteId ?? getDefaultAccessRouteId(server)
     const legacyJump = !server.accessRoutes?.length && Boolean(server.jumpHost) && routeId === 'jump'
-    const alias = legacyJump ? vscodeSshAlias(server.id) : vscodeRouteSshAlias(server.id, routeId)
-    if (await this.focusExistingWindow(alias)) {
+    const alias = legacyJump
+      ? vscodeSshAlias(server.id, server.name)
+      : vscodeRouteSshAlias(server.id, routeId, server.name)
+    const previousAlias = legacyJump
+      ? vscodeSshAlias(server.id)
+      : vscodeRouteSshAlias(server.id, routeId)
+    if (await this.focusExistingWindow(alias, previousAlias)) {
       return { status: 'focused', message: `${server.name} 的 VS Code 远程窗口已切到前台` }
     }
 
@@ -192,9 +206,12 @@ export class VsCodeService {
     if (nextConfig !== current.replace(/\r\n/g, '\n')) await writeFile(this.sshConfigPath, nextConfig, 'utf8')
   }
 
-  private async focusExistingWindow(alias: string): Promise<boolean> {
+  private async focusExistingWindow(alias: string, previousAlias?: string): Promise<boolean> {
     try {
-      await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', powershellFocusScript, alias], {
+      await execFileAsync('powershell.exe', [
+        '-NoProfile', '-NonInteractive', '-Command', powershellFocusScript,
+        ...new Set([alias, previousAlias].filter((item): item is string => Boolean(item)))
+      ], {
         windowsHide: true,
         timeout: 5000,
         maxBuffer: 64 * 1024

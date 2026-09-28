@@ -35,7 +35,7 @@ describe('VS Code Remote-SSH configuration', () => {
 
   it('writes a direct host without secrets', () => {
     const config = renderManagedSshConfig([server()])
-    expect(config).toContain('Host labdeck-e6de6bd7-2152-4090-b53e-72dbc5bb3a3e')
+    expect(config).toContain('Host labdeck-gpu-node-e6de6b')
     expect(config).toContain('  HostName gpu.example.test')
     expect(config).toContain('  Port 2222')
     expect(config).toContain('  IdentityFile "C:/Users/Lab User/.ssh/id_ed25519"')
@@ -55,8 +55,8 @@ describe('VS Code Remote-SSH configuration', () => {
       }),
       server({ id: 'demo', mode: 'demo' })
     ])
-    expect(config).toContain('Host labdeck-e6de6bd7-2152-4090-b53e-72dbc5bb3a3e-jump')
-    expect(config).toContain('  ProxyJump labdeck-e6de6bd7-2152-4090-b53e-72dbc5bb3a3e-jump')
+    expect(config).toContain('Host labdeck-gpu-node-e6de6b-jump')
+    expect(config).toContain('  ProxyJump labdeck-gpu-node-e6de6b-jump')
     expect(config).not.toContain('Host labdeck-demo')
     expect(config).not.toContain('hasSecret')
   })
@@ -75,9 +75,9 @@ describe('VS Code Remote-SSH configuration', () => {
         }
       ]
     })])
-    expect(config).toContain('Host labdeck-e6de6bd7-2152-4090-b53e-72dbc5bb3a3e')
-    expect(config).toContain('Host labdeck-e6de6bd7-2152-4090-b53e-72dbc5bb3a3e-jump')
+    expect(config).toContain('Host labdeck-gpu-node-e6de6b')
+    expect(config).toContain('Host labdeck-gpu-node-e6de6b-jump')
     expect(config).toContain('  HostName 10.10.0.8')
-    expect(config).toContain('  ProxyJump labdeck-e6de6bd7-2152-4090-b53e-72dbc5bb3a3e-jump-jump')
+    expect(config).toContain('  ProxyJump labdeck-gpu-node-e6de6b-jump-jump')
   })
 })
