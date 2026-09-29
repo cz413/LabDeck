@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Local screenshot capture</title>
+    <style>
+      body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #0b1118; color: #d8e2ec; font: 16px sans-serif; }
+      #paste-target { width: min(700px, 80vw); padding: 48px; border: 1px dashed #5c7184; border-radius: 14px; text-align: center; outline: none; }
+      #paste-target:focus { border-color: #57c7b3; }
+    </style>
+  </head>
+  <body>
+    <div id="paste-target" contenteditable="true" role="textbox" aria-label="本地图片粘贴区域">点击这里后按 Ctrl+V 粘贴刚才的真实界面截图</div>
+    <script type="module" src="/capture-drop.ts"></script>
+  </body>
+</html>

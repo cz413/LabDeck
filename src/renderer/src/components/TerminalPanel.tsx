@@ -4,6 +4,7 @@ import { Terminal } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import type { ServerProfile } from '@shared/types'
 import { getAccessRoute } from '@shared/access-routes'
+import type { ConfirmationRequest } from './ConfirmDialog'
 
 type TerminalPanelProps = {
   target: { type: 'local' }
@@ -16,6 +17,51 @@ type TerminalPanelProps = {
   name?: string
   onClose(): void
   onTrusted(): Promise<void>
+  confirm(request: ConfirmationRequest): Promise<boolean>
+  initialWorkingDirectory: string
+  initialCommand?: string
+  onWorkingDirectory(path: string): void
+}
+
+const normalizeRemotePath = (path: string): string => {
+  const parts: string[] = []
+  for (const part of path.split('/')) {
+    if (!part || part === '.') continue
+    if (part === '..') parts.pop()
+    else parts.push(part)
+  }
+  return `/${parts.join('/')}`
+}
+
+const parseOsc7Path = (payload: string): string | null => {
+  try {
+    const url = new URL(payload.trim())
+    if (url.protocol !== 'file:') return null
+    const path = decodeURIComponent(url.pathname)
+    return path.startsWith('/') ? normalizeRemotePath(path) : null
+  } catch {
+    return null
+  }
+}
+
+const cdDestination = (command: string, currentPath: string, homePath: string, previousPath: string): string | null => {
+  const match = /^(?:builtin\s+)?cd(?:\s+([\s\S]+))?$/.exec(command.trim())
+  if (!match) return null
+  let target = match[1]?.trim() ?? ''
+  if (!target || target === '--') return homePath
+  if (target.startsWith('-- ')) target = target.slice(3).trim()
+  else if (/^-[LP]\s+/.test(target)) target = target.replace(/^-[LP]\s+/, '')
+  if ((target.startsWith('"') && target.endsWith('"')) || (target.startsWith("'") && target.endsWith("'"))) {
+    target = target.slice(1, -1)
+  } else if (/\s/.test(target)) {
+    return null
+  }
+  target = target.replace(/\\ /g, ' ').replace(/\$\{HOME\}|\$HOME/g, homePath)
+  if (target === '-' ) return previousPath
+  if (target === '~') target = homePath
+  else if (target.startsWith('~/')) target = `${homePath}/${target.slice(2)}`
+  if (!target.startsWith('/')) target = `${currentPath}/${target}`
+  return normalizeRemotePath(target)
 }
 
 export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
@@ -24,6 +70,15 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
   const server = target.type === 'server' ? target.server : null
   const accessRouteId = target.type === 'server' ? target.accessRouteId : undefined
   const route = server ? getAccessRoute(server, accessRouteId) : null
+  const routeSummary = route
+    ? route.kind === 'jump' && route.jumpHost
+      ? `经跳板机 ${route.jumpHost.username}@${route.jumpHost.host}:${route.jumpHost.port} → ${route.username}@${route.host}:${route.port}`
+      : `直连 ${route.username}@${route.host}:${route.port}`
+    : ''
+  const homeDirectory = route ? `/home/${route.username.trim() || 'user'}` : ''
+  const initialWorkingDirectory = !isLocal && 'initialWorkingDirectory' in props
+    ? props.initialWorkingDirectory
+    : homeDirectory
   const targetKey = isLocal ? 'local' : `${server!.id}:${accessRouteId ?? 'default'}`
   const embedded = props.displayMode === 'embedded'
   const panelRef = useRef<HTMLDivElement>(null)
@@ -31,10 +86,15 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
   const terminalRef = useRef<Terminal | null>(null)
   const fitRef = useRef<FitAddon | null>(null)
   const sessionRef = useRef<string | null>(null)
+  const workingDirectoryRef = useRef(initialWorkingDirectory)
+  const previousDirectoryRef = useRef(initialWorkingDirectory)
+  const onWorkingDirectoryRef = useRef<((path: string) => void) | undefined>(undefined)
   const canAutofillPasswordRef = useRef(false)
   const passwordPromptRef = useRef(false)
   const manualPasswordInputRef = useRef(false)
   const outputTailRef = useRef('')
+  const launchCommandSentRef = useRef(false)
+  const launchCommandRef = useRef(!isLocal && 'initialCommand' in props ? props.initialCommand?.trim() : '')
   const noticeTimerRef = useRef<number | null>(null)
   const maximizedRef = useRef(false)
   const dragRef = useRef<{ pointerId: number; startX: number; startY: number; originX: number; originY: number; width: number; height: number } | null>(null)
@@ -48,6 +108,10 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
   const [dragging, setDragging] = useState(false)
   const [clipboardNotice, setClipboardNotice] = useState<string | null>(null)
   const [passwordPrompt, setPasswordPrompt] = useState(false)
+  if (server && 'initialWorkingDirectory' in props && props.initialWorkingDirectory) {
+    workingDirectoryRef.current = props.initialWorkingDirectory
+  }
+  onWorkingDirectoryRef.current = server && 'onWorkingDirectory' in props ? props.onWorkingDirectory : undefined
   maximizedRef.current = maximized
 
   const clampPosition = (x: number, y: number, width: number, height: number): { x: number; y: number } => ({
@@ -91,6 +155,57 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
     terminalRef.current = terminal
     fitRef.current = fit
 
+    const reportWorkingDirectory = (path: string): void => {
+      const normalized = normalizeRemotePath(path)
+      if (normalized === workingDirectoryRef.current) return
+      previousDirectoryRef.current = workingDirectoryRef.current
+      workingDirectoryRef.current = normalized
+      onWorkingDirectoryRef.current?.(normalized)
+    }
+    const directoryOscHandler = !isLocal
+      ? terminal.parser.registerOscHandler(7, (payload) => {
+          const path = parseOsc7Path(payload)
+          if (!path) return false
+          reportWorkingDirectory(path)
+          return true
+        })
+      : null
+    let shellCommandBuffer = ''
+    const trackShellInput = (data: string): void => {
+      if (data.includes('\x1b')) {
+        shellCommandBuffer = ''
+        return
+      }
+      for (const character of data) {
+        if (character === '\r' || character === '\n') {
+          const destination = cdDestination(
+            shellCommandBuffer,
+            workingDirectoryRef.current,
+            homeDirectory,
+            previousDirectoryRef.current
+          )
+          if (destination) reportWorkingDirectory(destination)
+          shellCommandBuffer = ''
+        } else if (character === '\x7f' || character === '\b') {
+          shellCommandBuffer = shellCommandBuffer.slice(0, -1)
+        } else if (character.charCodeAt(0) < 0x20) {
+          shellCommandBuffer = ''
+        } else {
+          shellCommandBuffer += character
+        }
+      }
+    }
+
+    const sendLaunchCommand = (): void => {
+      const command = launchCommandRef.current
+      const sessionId = sessionRef.current
+      if (!command || !sessionId || launchCommandSentRef.current) return
+      const lastLine = outputTailRef.current.split(/[\r\n]/).at(-1)?.trimEnd() ?? ''
+      if (!/[$#>%❯➜›]\s*$/.test(lastLine)) return
+      launchCommandSentRef.current = true
+      terminal.write(`\r\n\x1b[38;5;45m正在发送终端快捷命令…\x1b[0m\r\n`)
+      window.labApi.terminal.write(sessionId, `${command}\r`)
+    }
     const clearPasswordPrompt = (): void => {
       passwordPromptRef.current = false
       manualPasswordInputRef.current = false
@@ -100,9 +215,13 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
     const detachData = window.labApi.terminal.onData((event) => {
       if (event.sessionId !== sessionRef.current) return
       terminal.write(event.data)
-      if (isLocal || !canAutofillPasswordRef.current) return
-      const plainText = event.data.replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+      if (isLocal) return
+      const plainText = event.data
+        .replace(/\x1B\][^\x07]*(?:\x07|\x1B\\)/g, '')
+        .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
       outputTailRef.current = `${outputTailRef.current}${plainText}`.slice(-600)
+      sendLaunchCommand()
+      if (!canAutofillPasswordRef.current) return
       const detected = /(?:^|[\r\n])[^\r\n]{0,180}(?:password(?:\s+for\s+[^\r\n:：]+)?|密码)\s*[:：]\s*$/i.test(outputTailRef.current)
       if (detected && !passwordPromptRef.current) {
         passwordPromptRef.current = true
@@ -124,6 +243,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
     const input = terminal.onData((data) => {
       const sessionId = sessionRef.current
       if (!sessionId) return
+      if (!isLocal && !passwordPromptRef.current) trackShellInput(data)
       if (passwordPromptRef.current && !manualPasswordInputRef.current && data === '\r') {
         clearPasswordPrompt()
         void window.labApi.terminal.autofillPassword(sessionId).then((filled) => {
@@ -180,6 +300,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
     return () => {
       if (sessionRef.current) window.labApi.terminal.close(sessionRef.current)
       clearPasswordPrompt()
+      directoryOscHandler?.dispose()
       detachData()
       detachExit()
       input.dispose()
@@ -239,11 +360,13 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
       ? await window.labApi.terminal.connectLocal(terminal.cols, terminal.rows)
       : await window.labApi.terminal.connect(server!.id, terminal.cols, terminal.rows, accessRouteId)
     for (let attempt = 0; attempt < 2 && result.status === 'host-key-required' && result.fingerprint; attempt += 1) {
-      if (!server || props.target.type !== 'server') break
+      if (!server || !('confirm' in props)) break
       const targetName = result.hostKeyTarget === 'jumpHost' ? '跳板机' : '目标服务器'
-      const trusted = window.confirm(
-        `首次连接 ${server.name} 的${targetName}，请通过可信渠道核对主机指纹：\n\n${result.fingerprint}\n\n确认信任该主机吗？`
-      )
+      const trusted = await props.confirm({
+        title: '信任 SSH 主机指纹？',
+        message: `首次连接 ${server.name} 的${targetName}。请通过可信渠道核对以下指纹后再继续：\n\n${result.fingerprint}`,
+        confirmLabel: '信任并连接'
+      })
       if (!trusted) break
       await window.labApi.servers.trustHost(server.id, result.fingerprint, result.hostKeyTarget, accessRouteId)
       if ('onTrusted' in props) await props.onTrusted()
@@ -254,6 +377,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
       canAutofillPasswordRef.current = Boolean(result.canAutofillPassword)
       setStatus('online')
       terminal.focus()
+      if (launchCommandRef.current) terminal.write('\r\n已准备快捷命令，检测到远程 Shell 提示符后发送。\r\n')
     } else {
       canAutofillPasswordRef.current = false
       setStatus('offline')
@@ -261,9 +385,16 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
     }
   }
 
-  const reconnect = (): void => {
+  const reconnect = async (): Promise<void> => {
     if (!terminalRef.current) return
-    if (!isLocal && status === 'online' && !window.confirm('重新连接会先断开当前 SSH，会中断正在运行的前台命令。确定继续吗？')) return
+    if (!isLocal && status === 'online' && 'confirm' in props) {
+      const shouldReconnect = await props.confirm({
+        title: '重新连接 SSH？',
+        message: '当前连接会先断开，正在运行的前台命令可能会中断。',
+        confirmLabel: '重新连接'
+      })
+      if (!shouldReconnect) return
+    }
     if (sessionRef.current) window.labApi.terminal.close(sessionRef.current)
     sessionRef.current = null
     canAutofillPasswordRef.current = false
@@ -316,6 +447,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
         <div className="workspace-identity">
           {!embedded && <div className="terminal-server-icon">{isLocal ? <Laptop size={17} /> : <Server size={17} />}</div>}
           {!embedded && <div><strong>{isLocal ? (props.name ?? '本地终端') : server!.name}</strong><span>{isLocal ? 'PowerShell · 当前 Windows 用户' : `${route!.username}@${route!.host}:${route!.port} · ${route!.name}`}</span></div>}
+          {embedded && !isLocal && <div className="embedded-terminal-route"><strong>{server!.name}</strong><span title={routeSummary}>{routeSummary}</span></div>}
           <div className={`connection-pill ${status}`}><i />{status === 'online' ? (isLocal ? '运行中' : '已连接') : status === 'connecting' ? (isLocal ? '启动中' : '连接中') : (isLocal ? '已退出' : '已断开')}</div>
         </div>
         <div className="toolbar-actions">

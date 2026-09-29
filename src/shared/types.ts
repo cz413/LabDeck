@@ -176,6 +176,7 @@ export interface SshConfigCandidate {
   username: string
   identityFile?: string
   proxyJump?: string
+  proxyCommand?: string
   alreadyImported: boolean
 }
 
@@ -226,7 +227,135 @@ export interface AppSettings {
   minimizeToTray: boolean
   closeBehavior: CloseBehavior
   notifyOnWarning: boolean
+  serverOrder: string[]
   gpuWatches: GpuWatchTarget[]
+}
+
+export type ExperimentTaskStatus = 'planned' | 'queued' | 'preparing' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
+export type ExperimentPriority = 'low' | 'normal' | 'high'
+export type ExperimentRunStatus = 'queued' | 'preparing' | 'running' | 'paused' | 'completed' | 'failed' | 'cancelled'
+export type CondaManager = 'conda' | 'mamba' | 'micromamba'
+
+export interface CondaEnvironmentConfig {
+  manager: CondaManager
+  managerPath?: string
+  environmentName?: string
+  environmentPrefix?: string
+  environmentFilePath?: string
+  pythonInterpreterPath?: string
+  pythonVersion?: string
+  lastCheckStatus?: 'found' | 'missing' | 'unknown'
+  lastCheckedAt?: string
+}
+
+export interface ExperimentRun {
+  id: string
+  number: number
+  status: ExperimentRunStatus
+  queuedAt?: string
+  startedAt?: string
+  finishedAt?: string
+  serverId?: string
+  serverNameSnapshot?: string
+  accessRouteId?: string
+  gpuUuid?: string
+  gpuIndex?: number
+  gpuNameSnapshot?: string
+  codePath?: string
+  dataPath?: string
+  launchCommand?: string
+  condaEnvironment?: CondaEnvironmentConfig
+  artifactPath?: string
+  minimumFreeVramGiB?: number | null
+  maximumGpuUtilizationPercent?: number | null
+  message?: string
+  remotePid?: number
+  remoteRunDir?: string
+  logPath?: string
+  resultSummary: string
+  notes: string
+}
+
+export interface ExperimentRunStartInput {
+  serverId: string | null
+  accessRouteId: string | null
+  gpuUuid: string | null
+  gpuIndex: number | null
+  gpuNameSnapshot: string | null
+  codePath: string
+  dataPath: string
+  launchCommand: string
+  condaEnvironment: CondaEnvironmentConfig | null
+  artifactPath: string
+  minimumFreeVramGiB: number | null
+  maximumGpuUtilizationPercent: number | null
+  notes: string
+}
+
+export interface ExperimentTask {
+  id: string
+  title: string
+  project: string
+  objective: string
+  tags: string[]
+  priority: ExperimentPriority
+  status: ExperimentTaskStatus
+  serverId?: string
+  serverNameSnapshot?: string
+  accessRouteId?: string
+  gpuUuid?: string
+  gpuIndex?: number
+  gpuNameSnapshot?: string
+  codePath: string
+  dataPath: string
+  launchCommand: string
+  condaEnvironment?: CondaEnvironmentConfig
+  minimumFreeVramGiB?: number
+  maximumGpuUtilizationPercent?: number
+  artifactPath: string
+  resultSummary: string
+  notes: string
+  archived: boolean
+  createdAt: string
+  updatedAt: string
+  runs: ExperimentRun[]
+}
+
+export type ExperimentTaskDraft = Omit<ExperimentTask, 'id' | 'createdAt' | 'updatedAt' | 'archived' | 'runs'> & { id?: string }
+
+export interface CondaEnvironmentInfo {
+  name: string
+  prefix: string
+}
+
+export interface CondaEnvironmentList {
+  environments: CondaEnvironmentInfo[]
+  managerPath: string
+}
+
+export interface CondaEnvironmentCheck {
+  found: boolean
+  name: string
+  prefix: string
+  managerPath?: string
+  pythonInterpreterPath?: string
+  pythonVersion?: string
+}
+
+export type RemoteCondaResult<T> =
+  | { status: 'success'; value: T }
+  | {
+      status: 'host-key-required'
+      fingerprint: string
+      hostKeyTarget: 'server' | 'jumpHost'
+      message: string
+    }
+
+export interface ExperimentRunFinishInput {
+  status: Exclude<ExperimentRunStatus, 'queued' | 'preparing' | 'running'>
+  resultSummary: string
+  notes: string
+  artifactPath: string
 }
 
 export interface AppApi {
@@ -251,7 +380,6 @@ export interface AppApi {
     choosePrivateKey(): Promise<string | null>
   }
   sshConfig: {
-    scan(): Promise<{ configPath: string; candidates: SshConfigCandidate[] }>
     importAll(): Promise<SshConfigImportResult>
   }
   monitor: {
@@ -270,7 +398,8 @@ export interface AppApi {
     onExit(listener: (event: TerminalExitEvent) => void): () => void
   }
   sftp: {
-    openWindow(serverId: string, accessRouteId?: string): Promise<void>
+    openWindow(serverId: string, accessRouteId?: string, initialPath?: string): Promise<void>
+    onNavigate(listener: (path: string) => void): () => void
     list(serverId: string, path: string, accessRouteId?: string): Promise<SftpEntry[]>
     chooseUploadFile(): Promise<string | null>
     upload(serverId: string, localPath: string, remotePath: string, transferId: string, accessRouteId?: string): Promise<void>
@@ -278,7 +407,23 @@ export interface AppApi {
     onProgress(listener: (event: SftpTransferProgress) => void): () => void
   }
   vscode: {
-    openRemote(serverId: string, accessRouteId?: string): Promise<VsCodeRemoteResult>
+    openRemote(serverId: string, accessRouteId?: string, remotePath?: string): Promise<VsCodeRemoteResult>
+  }
+  experiments: {
+    list(): Promise<ExperimentTask[]>
+    save(input: ExperimentTaskDraft): Promise<ExperimentTask>
+    setStatus(taskId: string, status: ExperimentTaskStatus): Promise<ExperimentTask>
+    startRun(taskId: string, input: ExperimentRunStartInput): Promise<ExperimentTask>
+    cancelQueuedRun(taskId: string, runId: string): Promise<ExperimentTask>
+    cancelRun(taskId: string, runId: string): Promise<ExperimentTask>
+    deleteQueuedRun(taskId: string, runId: string): Promise<ExperimentTask>
+    deleteTask(taskId: string): Promise<void>
+    finishRun(taskId: string, runId: string, input: ExperimentRunFinishInput): Promise<ExperimentTask>
+    onChanged(listener: () => void): () => void
+    setArchived(taskId: string, archived: boolean): Promise<ExperimentTask>
+    listCondaEnvironments(serverId: string, accessRouteId: string, manager: CondaManager, managerPath?: string): Promise<RemoteCondaResult<CondaEnvironmentList>>
+    checkCondaEnvironment(serverId: string, accessRouteId: string, config: CondaEnvironmentConfig): Promise<RemoteCondaResult<CondaEnvironmentCheck>>
+    getCondaEnvironmentCommand(config: CondaEnvironmentConfig, updateExisting: boolean): Promise<{ command: string }>
   }
   settings: {
     get(): Promise<AppSettings>

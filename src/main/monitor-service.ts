@@ -1,4 +1,5 @@
 import type { FileSystemMetric, GpuMetric, GpuProcessMetric, ServerProfile, ServerSnapshot } from '../shared/types'
+import type { Client } from 'ssh2'
 import type { ServerSecrets } from './store'
 import { SshService } from './ssh-service'
 
@@ -24,19 +25,79 @@ interface CpuCounters {
   total: number
 }
 
+interface PooledMonitorConnection {
+  key: string
+  serverId: string
+  client: Client
+  lastUsedAt: number
+  closed: boolean
+}
+
+const CONNECTION_SWEEP_INTERVAL_MS = 15_000
+const MIN_CONNECTION_IDLE_MS = 90_000
+const MAX_CONNECTION_IDLE_MS = 10 * 60_000
+
 export class MonitorService {
   private readonly previousCpu = new Map<string, CpuCounters>()
+  private readonly connections = new Map<string, PooledMonitorConnection>()
+  private readonly pendingConnections = new Map<string, Promise<PooledMonitorConnection>>()
+  private readonly inFlightSnapshots = new Map<string, Promise<ServerSnapshot>>()
+  private readonly snapshotQueues = new Map<string, Promise<void>>()
+  private readonly serverGenerations = new Map<string, number>()
+  private readonly cleanupTimer: ReturnType<typeof setInterval>
+  private idleConnectionTimeoutMs = MIN_CONNECTION_IDLE_MS
+  private shuttingDown = false
 
-  constructor(private readonly ssh: SshService) {}
+  constructor(private readonly ssh: SshService) {
+    this.cleanupTimer = setInterval(() => this.closeExpiredConnections(), CONNECTION_SWEEP_INTERVAL_MS)
+    this.cleanupTimer.unref()
+  }
 
-  async snapshot(profile: ServerProfile, secrets: ServerSecrets): Promise<ServerSnapshot> {
-    if (profile.mode === 'demo') return this.demoSnapshot(profile)
+  setPollingInterval(seconds: number): void {
+    this.idleConnectionTimeoutMs = Math.max(
+      MIN_CONNECTION_IDLE_MS,
+      Math.min(MAX_CONNECTION_IDLE_MS, seconds * 2_000)
+    )
+    this.closeExpiredConnections()
+  }
+
+  invalidateServer(serverId: string): void {
+    this.serverGenerations.set(serverId, (this.serverGenerations.get(serverId) ?? 0) + 1)
+    for (const connection of this.connections.values()) {
+      if (connection.serverId === serverId) this.retireConnection(connection)
+    }
+  }
+
+  closeAll(): void {
+    if (this.shuttingDown) return
+    this.shuttingDown = true
+    clearInterval(this.cleanupTimer)
+    for (const connection of this.connections.values()) this.retireConnection(connection)
+  }
+
+  snapshot(profile: ServerProfile, secrets: ServerSecrets): Promise<ServerSnapshot> {
+    if (profile.mode === 'demo') return Promise.resolve(this.demoSnapshot(profile))
+    const key = this.connectionKey(profile)
+    const current = this.inFlightSnapshots.get(key)
+    if (current) return current
+
+    const request = this.enqueueSnapshot(profile.id, () => this.collectSnapshot(profile, secrets, key))
+    this.inFlightSnapshots.set(key, request)
+    void request.then(
+      () => { if (this.inFlightSnapshots.get(key) === request) this.inFlightSnapshots.delete(key) },
+      () => { if (this.inFlightSnapshots.get(key) === request) this.inFlightSnapshots.delete(key) }
+    )
+    return request
+  }
+
+  private async collectSnapshot(
+    profile: ServerProfile,
+    secrets: ServerSecrets,
+    key: string
+  ): Promise<ServerSnapshot> {
     const startedAt = Date.now()
-    let client
     try {
-      const connected = await this.ssh.connect(profile, secrets)
-      client = connected.client
-      const raw = await this.ssh.exec(client, METRICS_COMMAND, 15000)
+      const raw = await this.executeMetricsCommand(profile, secrets, key)
       return this.parseSnapshot(profile.id, raw, Math.max(1, Date.now() - startedAt))
     } catch (error) {
       return {
@@ -53,9 +114,115 @@ export class MonitorService {
         gpus: [],
         error: error instanceof Error ? error.message : '监控采集失败'
       }
-    } finally {
-      client?.end()
     }
+  }
+
+  private async executeMetricsCommand(profile: ServerProfile, secrets: ServerSecrets, key: string): Promise<string> {
+    let connection = await this.getConnection(profile, secrets, key)
+    try {
+      const raw = await this.ssh.exec(connection.client, METRICS_COMMAND, 15000)
+      connection.lastUsedAt = Date.now()
+      return raw
+    } catch (error) {
+      if (!connection.closed || this.shuttingDown) throw error
+      this.retireConnection(connection)
+      connection = await this.getConnection(profile, secrets, key)
+      const raw = await this.ssh.exec(connection.client, METRICS_COMMAND, 15000)
+      connection.lastUsedAt = Date.now()
+      return raw
+    }
+  }
+
+  private getConnection(
+    profile: ServerProfile,
+    secrets: ServerSecrets,
+    key: string
+  ): Promise<PooledMonitorConnection> {
+    if (this.shuttingDown) return Promise.reject(new Error('应用正在退出'))
+    if (key !== this.connectionKey(profile)) {
+      return Promise.reject(new Error('服务器连接配置已变更，请重新采集'))
+    }
+    const existing = this.connections.get(key)
+    if (existing && !existing.closed) {
+      existing.lastUsedAt = Date.now()
+      return Promise.resolve(existing)
+    }
+    const pending = this.pendingConnections.get(key)
+    if (pending) return pending
+
+    const generation = this.serverGenerations.get(profile.id) ?? 0
+    const connectionPromise = this.ssh.connect(profile, secrets).then(({ client }) => {
+      if (this.shuttingDown || generation !== (this.serverGenerations.get(profile.id) ?? 0)) {
+        client.end()
+        throw new Error('服务器连接配置已变更，请重新采集')
+      }
+
+      const connection: PooledMonitorConnection = {
+        key,
+        serverId: profile.id,
+        client,
+        lastUsedAt: Date.now(),
+        closed: false
+      }
+      client.once('close', () => this.retireConnection(connection, false))
+      client.on('error', (error) => {
+        console.warn(`监控 SSH 连接中断（${profile.name}）：`, error instanceof Error ? error.message : error)
+        this.retireConnection(connection)
+      })
+      this.connections.set(key, connection)
+      return connection
+    }).finally(() => {
+      this.pendingConnections.delete(key)
+    })
+    this.pendingConnections.set(key, connectionPromise)
+    return connectionPromise
+  }
+
+  private connectionKey(profile: ServerProfile): string {
+    const jump = profile.jumpHost
+    return JSON.stringify([
+      profile.id,
+      this.serverGenerations.get(profile.id) ?? 0,
+      profile.host,
+      profile.port,
+      profile.username,
+      profile.authType,
+      profile.privateKeyPath ?? '',
+      profile.hostFingerprint ?? '',
+      jump ? [
+        jump.host,
+        jump.port,
+        jump.username,
+        jump.authType,
+        jump.privateKeyPath ?? '',
+        jump.hostFingerprint ?? ''
+      ] : null
+    ])
+  }
+
+  private enqueueSnapshot<T>(serverId: string, run: () => Promise<T>): Promise<T> {
+    const previous = this.snapshotQueues.get(serverId)
+    const request = previous ? previous.then(run, run) : run()
+    const queueTail = request.then(() => undefined, () => undefined)
+    this.snapshotQueues.set(serverId, queueTail)
+    void queueTail.then(() => {
+      if (this.snapshotQueues.get(serverId) === queueTail) this.snapshotQueues.delete(serverId)
+    })
+    return request
+  }
+
+  private closeExpiredConnections(): void {
+    const now = Date.now()
+    for (const connection of this.connections.values()) {
+      if (now - connection.lastUsedAt >= this.idleConnectionTimeoutMs) this.retireConnection(connection)
+    }
+  }
+
+  private retireConnection(connection: PooledMonitorConnection, closeClient = true): void {
+    if (connection.closed) return
+    connection.closed = true
+    if (this.connections.get(connection.key) === connection) this.connections.delete(connection.key)
+    if (closeClient) connection.client.end()
   }
 
   private parseSnapshot(serverId: string, raw: string, latencyMs: number): ServerSnapshot {

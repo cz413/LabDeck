@@ -9,6 +9,7 @@ import type {
   SshConfigCandidate,
   SshConfigImportResult
 } from '../shared/types'
+import { getAccessRoutes } from '../shared/access-routes'
 import type { AppStore } from './store'
 
 const execFileAsync = promisify(execFile)
@@ -20,6 +21,7 @@ interface ResolvedSshHost {
   username: string
   identityFile?: string
   proxyJump?: string
+  proxyCommand?: string
 }
 
 export class SshConfigService {
@@ -42,10 +44,13 @@ export class SshConfigService {
         username: item.username,
         identityFile: item.identityFile,
         proxyJump: item.proxyJump,
-        alreadyImported: existing.some(
-          (server) =>
-            server.name === item.alias ||
-            (server.host === item.host && server.port === item.port && server.username === item.username)
+        proxyCommand: item.proxyCommand,
+        alreadyImported: existing.some((server) =>
+          server.name === item.alias ||
+          (server.host === item.host && server.port === item.port && server.username === item.username) ||
+          getAccessRoutes(server).some((route) =>
+            route.host === item.host && route.port === item.port && route.username === item.username
+          )
         )
       }]
     })
@@ -58,14 +63,37 @@ export class SshConfigService {
     const skipped: string[] = []
 
     for (const candidate of candidates) {
-      if (candidate.alreadyImported) {
-        skipped.push(candidate.alias)
-        continue
-      }
       try {
-        const jumpHost = candidate.proxyJump
-          ? await this.resolveJumpHost(candidate.proxyJump)
-          : undefined
+        const servers = this.store.listServers()
+        const sameNameOrEndpoint = servers.find((server) =>
+          server.name === candidate.alias ||
+          (server.host === candidate.host && server.port === candidate.port && server.username === candidate.username)
+        )
+        const routeOwner = sameNameOrEndpoint ?? servers.find((server) =>
+          getAccessRoutes(server).some((route) =>
+            route.kind === 'jump' &&
+            route.host === candidate.host && route.port === candidate.port && route.username === candidate.username
+          )
+        )
+        const matchingRoute = routeOwner && getAccessRoutes(routeOwner).find((route) =>
+          route.host === candidate.host && route.port === candidate.port && route.username === candidate.username
+        )
+        const hasJumpConfiguration = Boolean(candidate.proxyJump || candidate.proxyCommand)
+        if (routeOwner) {
+          const sameEndpoint = routeOwner.host === candidate.host && routeOwner.port === candidate.port && routeOwner.username === candidate.username
+          const existingJumpRoute = matchingRoute?.kind === 'jump'
+          if (hasJumpConfiguration && (sameEndpoint || existingJumpRoute)) {
+            const jumpHost = await this.resolveJumpHostForAlias(candidate.alias)
+            if (!jumpHost) throw new Error('未能解析 ProxyJump 或 ProxyCommand 中的跳板机')
+            imported.push(await this.store.mergeSshConfigJumpHost(routeOwner.id, jumpHost, existingJumpRoute ? matchingRoute?.id : undefined))
+          } else {
+            skipped.push(candidate.alias)
+          }
+          continue
+        }
+
+        const jumpHost = hasJumpConfiguration ? await this.resolveJumpHostForAlias(candidate.alias) : undefined
+        if (hasJumpConfiguration && !jumpHost) throw new Error('未能解析 ProxyJump 或 ProxyCommand 中的跳板机')
         const input: ServerProfileInput = {
           name: candidate.alias,
           host: candidate.host,
@@ -74,7 +102,7 @@ export class SshConfigService {
           authType: candidate.identityFile ? 'privateKey' : 'password',
           privateKeyPath: candidate.identityFile,
           group: 'SSH Config',
-          tags: candidate.proxyJump ? ['SSH Config', '跳板机'] : ['SSH Config'],
+          tags: hasJumpConfiguration ? ['SSH Config', '跳板机'] : ['SSH Config'],
           mode: 'real',
           monitorPolicy: 'manual',
           jumpHost
@@ -86,6 +114,28 @@ export class SshConfigService {
       }
     }
     return { imported, skipped, configPath: this.configPath }
+  }
+
+  async mergeAccessRoute(serverId: string, sourceServerId: string): Promise<ReturnType<AppStore['getServer']>> {
+    const source = this.store.getServer(sourceServerId)
+    const sourceRoute = getAccessRoutes(source).find((route) => route.kind === 'jump') ?? getAccessRoutes(source)[0]
+    if (!sourceRoute) throw new Error('没有可合并的连接路径')
+
+    let jumpHost: JumpHostConfig | undefined
+    let resolutionError: unknown
+    try {
+      jumpHost = await this.resolveJumpHostForAlias(source.name)
+    } catch (error) {
+      resolutionError = error
+    }
+    jumpHost ??= sourceRoute.jumpHost ?? source.jumpHost
+
+    if (!jumpHost) {
+      const errorDetails = resolutionError instanceof Error ? `：${resolutionError.message}` : ''
+      throw new Error(`无法解析“${source.name}”的跳板机信息${errorDetails}。请确认 SSH Config 中的 ProxyJump，或使用 ssh -W %h:%p <跳板机别名> 格式的 ProxyCommand；未执行合并。`)
+    }
+
+    return this.store.mergeAccessRoute(serverId, sourceServerId, jumpHost)
   }
 
   async collectAliases(configPath: string): Promise<string[]> {
@@ -143,13 +193,15 @@ export class SshConfigService {
     const username = values.get('user')?.[0] ?? process.env.USERNAME ?? ''
     const identityFiles = values.get('identityfile') ?? []
     const proxyJumpValue = values.get('proxyjump')?.[0]
+    const proxyCommandValue = values.get('proxycommand')?.[0]
     return {
       alias,
       host,
       port: Number.isInteger(port) && port > 0 && port <= 65535 ? port : 22,
       username,
       identityFile: identityFiles.map((item) => this.expandPath(item)).find(Boolean),
-      proxyJump: proxyJumpValue && proxyJumpValue !== 'none' ? proxyJumpValue : undefined
+      proxyJump: proxyJumpValue && proxyJumpValue !== 'none' ? proxyJumpValue : undefined,
+      proxyCommand: proxyCommandValue && proxyCommandValue !== 'none' ? proxyCommandValue : undefined
     }
   }
 
@@ -169,6 +221,19 @@ export class SshConfigService {
     return resolved
   }
 
+  private async resolveJumpHostForAlias(alias: string): Promise<JumpHostConfig | undefined> {
+    const resolved = await this.resolveAlias(alias)
+    if (resolved.proxyJump) return this.resolveJumpHost(resolved.proxyJump)
+    if (resolved.proxyCommand) {
+      const jumpAlias = this.proxyCommandJumpAlias(resolved.proxyCommand)
+      if (!jumpAlias) {
+        throw new Error(`不支持此 ProxyCommand 格式：“${resolved.proxyCommand}”`)
+      }
+      return this.resolveJumpHost(jumpAlias)
+    }
+    return undefined
+  }
+
   private async resolveJumpHost(proxyJump: string): Promise<JumpHostConfig> {
     const firstHop = proxyJump.split(',')[0].trim()
     if (!firstHop) throw new Error('ProxyJump 配置为空')
@@ -181,6 +246,24 @@ export class SshConfigService {
       privateKeyPath: resolved.identityFile,
       hasSecret: false
     }
+  }
+
+  private proxyCommandJumpAlias(proxyCommand: string): string | undefined {
+    const args = this.splitArguments(proxyCommand)
+    const executable = args[0]?.split(/[\\/]/).pop()?.replace(/\.exe$/i, '').toLowerCase()
+    if (executable !== 'ssh') return undefined
+    const streamLocalIndex = args.findIndex((arg) => arg.toLowerCase() === '-w')
+    if (streamLocalIndex < 0 || args[streamLocalIndex + 1] !== '%h:%p') return undefined
+
+    let index = streamLocalIndex + 2
+    const optionsWithValues = new Set(['-B', '-b', '-c', '-D', '-E', '-e', '-F', '-I', '-i', '-J', '-L', '-l', '-m', '-O', '-o', '-P', '-p', '-Q', '-R', '-S', '-w'])
+    while (index < args.length) {
+      const arg = args[index]
+      if (arg === '--') return args[index + 1]
+      if (!arg.startsWith('-')) return arg.includes('%') ? undefined : arg
+      index += optionsWithValues.has(arg) ? 2 : 1
+    }
+    return undefined
   }
 
   private async firstExistingFile(paths: string[]): Promise<string | undefined> {

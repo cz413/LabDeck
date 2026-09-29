@@ -6,14 +6,16 @@ import { getAccessRoute } from '@shared/access-routes'
 interface SftpPanelProps {
   server: ServerProfile
   accessRouteId?: string
+  initialPath?: string
   onClose(): void
   onMessage(message: string, kind?: 'success' | 'error'): void
 }
 
-export function SftpWindowApp({ serverId, accessRouteId }: { serverId: string; accessRouteId?: string }): React.JSX.Element {
+export function SftpWindowApp({ serverId, accessRouteId, initialPath: requestedInitialPath }: { serverId: string; accessRouteId?: string; initialPath?: string }): React.JSX.Element {
   const [server, setServer] = useState<ServerProfile | null>(null)
   const [error, setError] = useState('')
   const [message, setMessage] = useState('')
+  const [initialPath, setInitialPath] = useState(requestedInitialPath)
 
   useEffect(() => {
     void Promise.all([window.labApi.servers.list(), window.labApi.settings.get()])
@@ -26,9 +28,11 @@ export function SftpWindowApp({ serverId, accessRouteId }: { serverId: string; a
       .catch((caught) => setError(caught instanceof Error ? caught.message : '文件传输窗口初始化失败'))
   }, [serverId])
 
+  useEffect(() => window.labApi.sftp.onNavigate(setInitialPath), [])
+
   if (error) return <StandaloneWindowState message={error} error />
   if (!server) return <StandaloneWindowState message="正在打开文件传输窗口…" />
-  return <div className="standalone-sftp-shell"><SftpPanel server={server} accessRouteId={accessRouteId} onClose={() => window.labApi.windowControls.close()} onMessage={(nextMessage, kind = 'success') => { setMessage(`${kind === 'error' ? '失败：' : ''}${nextMessage}`); window.setTimeout(() => setMessage(''), 3600) }} />{message && <div className={`sftp-window-message ${message.startsWith('失败：') ? 'error' : ''}`}>{message}</div>}</div>
+  return <div className="standalone-sftp-shell"><SftpPanel server={server} accessRouteId={accessRouteId} initialPath={initialPath} onClose={() => window.labApi.windowControls.close()} onMessage={(nextMessage, kind = 'success') => { setMessage(`${kind === 'error' ? '失败：' : ''}${nextMessage}`); window.setTimeout(() => setMessage(''), 3600) }} />{message && <div className={`sftp-window-message ${message.startsWith('失败：') ? 'error' : ''}`}>{message}</div>}</div>
 }
 
 function StandaloneWindowState({ message, error = false }: { message: string; error?: boolean }): React.JSX.Element {
@@ -70,11 +74,12 @@ function TransferList({ transfers }: { transfers: SftpTransferProgress[] }): Rea
   </div>
 }
 
-export function SftpPanel({ server, accessRouteId, onClose, onMessage }: SftpPanelProps): React.JSX.Element {
+export function SftpPanel({ server, accessRouteId, initialPath, onClose, onMessage }: SftpPanelProps): React.JSX.Element {
   const route = getAccessRoute(server, accessRouteId)
-  const homePath = route.username.trim() ? `/home/${route.username.trim()}` : '/'
-  const [path, setPath] = useState(homePath)
-  const [pathInput, setPathInput] = useState(homePath)
+  const homePath = `/home/${route.username.trim() || 'user'}`
+  const defaultPath = initialPath?.startsWith('/') ? normalizePathInput(initialPath) : homePath
+  const [path, setPath] = useState(defaultPath)
+  const [pathInput, setPathInput] = useState(defaultPath)
   const [entries, setEntries] = useState<SftpEntry[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
@@ -95,7 +100,7 @@ export function SftpPanel({ server, accessRouteId, onClose, onMessage }: SftpPan
     }
   }
 
-  useEffect(() => { void load(homePath) }, [server.id, homePath, accessRouteId])
+  useEffect(() => { void load(defaultPath) }, [server.id, defaultPath, accessRouteId])
   useEffect(() => window.labApi.sftp.onProgress((progress) => {
     setTransfers((current) => {
       const index = current.findIndex((item) => item.transferId === progress.transferId)

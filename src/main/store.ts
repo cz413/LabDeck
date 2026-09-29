@@ -2,17 +2,18 @@ import { app, safeStorage } from 'electron'
 import { randomUUID } from 'node:crypto'
 import { mkdir, readFile, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import type { AppSettings, GpuHistoryPoint, GpuHistoryRange, ServerAccessRoute, ServerProfile, ServerProfileInput, ServerSnapshot } from '../shared/types'
-import { appSettingsSchema, serverProfileInputSchema } from '../shared/schemas'
+import type { AppSettings, ExperimentRun, ExperimentRunFinishInput, ExperimentRunStartInput, ExperimentTask, ExperimentTaskDraft, ExperimentTaskStatus, GpuHistoryPoint, GpuHistoryRange, JumpHostConfig, ServerAccessRoute, ServerProfile, ServerProfileInput, ServerSnapshot } from '../shared/types'
+import { appSettingsSchema, experimentRunFinishInputSchema, experimentRunStartInputSchema, experimentTaskDraftSchema, experimentTaskSchema, experimentTaskStatusSchema, serverProfileInputSchema } from '../shared/schemas'
 import { getAccessRoutes } from '../shared/access-routes'
 
 interface PersistedData {
-  version: 3
+  version: number
   servers: ServerProfile[]
   secrets: Record<string, string>
   settings: AppSettings
   gpuHistory: Record<string, GpuHistoryPoint[]>
   lastSnapshots: Record<string, ServerSnapshot>
+  experimentTasks: ExperimentTask[]
 }
 
 const MAX_GPU_HISTORY_POINTS = 2880
@@ -27,15 +28,28 @@ export interface ServerSecrets {
 const defaultSettings: AppSettings = {
   theme: 'ocean',
   monitoringEnabled: true,
-  pollingIntervalSeconds: 60,
+  pollingIntervalSeconds: 30,
   maxConcurrentPolls: 5,
   minimizeToTray: true,
   closeBehavior: 'ask',
   notifyOnWarning: true,
+  serverOrder: [],
   gpuWatches: []
 }
 
 const now = (): string => new Date().toISOString()
+
+const parseExperimentTasks = (value: unknown): ExperimentTask[] => {
+  if (!Array.isArray(value)) return []
+  return value.flatMap((task, index) => {
+    const parsed = experimentTaskSchema.safeParse(task)
+    if (!parsed.success) {
+      console.warn(`实验任务记录 ${index + 1} 格式无效，已跳过：`, parsed.error.message)
+      return []
+    }
+    return [parsed.data]
+  })
+}
 
 const demoServers = (): ServerProfile[] => [
   {
@@ -100,8 +114,9 @@ export class AppStore {
       const raw = await readFile(this.filePath, 'utf8')
       const parsed = JSON.parse(raw) as PersistedData
       const persistedSettings = parsed.settings as Partial<AppSettings> | undefined
+      const migratePollingInterval = parsed.version < 6
       this.data = {
-        version: 3,
+        version: 6,
         servers: Array.isArray(parsed.servers)
           ? parsed.servers.map((server) => ({
               ...server,
@@ -111,23 +126,29 @@ export class AppStore {
         secrets: parsed.secrets ?? {},
         settings: appSettingsSchema.parse({
           ...(persistedSettings ?? defaultSettings),
+          pollingIntervalSeconds: migratePollingInterval
+            ? Math.min(persistedSettings?.pollingIntervalSeconds ?? defaultSettings.pollingIntervalSeconds, 30)
+            : persistedSettings?.pollingIntervalSeconds ?? defaultSettings.pollingIntervalSeconds,
           closeBehavior: persistedSettings?.closeBehavior ?? (persistedSettings?.minimizeToTray === false ? 'exit' : 'ask')
         }),
         gpuHistory: parsed.gpuHistory ?? {},
-        lastSnapshots: parsed.lastSnapshots ?? {}
+        lastSnapshots: parsed.lastSnapshots ?? {},
+        experimentTasks: parseExperimentTasks(parsed.experimentTasks)
       }
+      if (migratePollingInterval) await this.persist()
     } catch (error) {
       const isMissing = (error as NodeJS.ErrnoException).code === 'ENOENT'
       if (!isMissing) {
         console.warn('配置读取失败，将使用新的本地配置：', error)
       }
       this.data = {
-        version: 3,
+        version: 6,
         servers: demoServers(),
         secrets: {},
         settings: defaultSettings,
         gpuHistory: {},
-        lastSnapshots: {}
+        lastSnapshots: {},
+        experimentTasks: []
       }
       await this.persist()
     }
@@ -266,6 +287,7 @@ export class AppStore {
     delete data.secrets[id]
     delete data.lastSnapshots[id]
     data.settings.gpuWatches = data.settings.gpuWatches.filter((watch) => watch.serverId !== id)
+    data.settings.serverOrder = data.settings.serverOrder.filter((serverId) => serverId !== id)
     for (const key of Object.keys(data.gpuHistory)) {
       if (key.startsWith(`${id}::`)) delete data.gpuHistory[key]
     }
@@ -274,10 +296,11 @@ export class AppStore {
 
   /**
    * Consolidate a legacy duplicate (for example `gpu8-jump`) into the
-   * canonical server record while keeping its endpoint as another route.
+   * canonical server record while keeping its resolved SSH route, including
+   * the actual ProxyJump/ProxyCommand hop, intact.
    * The caller is expected to confirm this user-visible operation first.
    */
-  async mergeAccessRoute(serverId: string, sourceServerId: string): Promise<ServerProfile> {
+  async mergeAccessRoute(serverId: string, sourceServerId: string, resolvedJumpHost?: JumpHostConfig): Promise<ServerProfile> {
     if (serverId === sourceServerId) throw new Error('不能将服务器合并到自身')
     const data = this.ensureData()
     const baseIndex = data.servers.findIndex((item) => item.id === serverId)
@@ -288,34 +311,53 @@ export class AppStore {
     const sourceRoute = getAccessRoutes(source).find((route) => route.kind === 'jump') ?? getAccessRoutes(source)[0]
     if (!sourceRoute) throw new Error('没有可合并的连接路径')
     const existingRoutes = getAccessRoutes(base)
-    const routeId = `jump-${source.id.slice(0, 8).toLowerCase()}`
+    const existingJumpRoute = existingRoutes.find((route) => route.kind === 'jump')
+    const routeWithSameTarget = existingRoutes.find((route) =>
+      route.kind === 'jump' &&
+      route.host === sourceRoute.host && route.port === sourceRoute.port && route.username === sourceRoute.username
+    )
+    const routeToReplace = routeWithSameTarget ?? existingJumpRoute
+    const candidateJumpHost = resolvedJumpHost ?? sourceRoute.jumpHost ?? source.jumpHost
+    const previousJumpHost = existingJumpRoute?.jumpHost ?? base.jumpHost
+    const sameJumpHost = Boolean(
+      previousJumpHost && candidateJumpHost &&
+      previousJumpHost.host === candidateJumpHost.host &&
+      previousJumpHost.port === candidateJumpHost.port &&
+      previousJumpHost.username === candidateJumpHost.username
+    )
+    const mergedJumpHost = candidateJumpHost ? {
+      ...candidateJumpHost,
+      hostFingerprint: sameJumpHost ? previousJumpHost?.hostFingerprint : candidateJumpHost.hostFingerprint,
+      hasSecret: sameJumpHost ? Boolean(previousJumpHost?.hasSecret || candidateJumpHost.hasSecret) : Boolean(candidateJumpHost.hasSecret)
+    } : undefined
+    let routeId = routeToReplace?.id ?? `jump-${source.id.slice(0, 8).toLowerCase()}`
+    while (!routeToReplace && existingRoutes.some((route) => route.id === routeId)) routeId = `${routeId}-1`
     const mergedRoute: ServerAccessRoute = {
       ...sourceRoute,
-      id: existingRoutes.some((route) => route.id === routeId) ? `${routeId}-${Date.now()}` : routeId,
-      name: sourceRoute.kind === 'jump' ? '跳板机' : `${source.name} · 备用路径`,
-      kind: 'jump'
+      id: routeId,
+      name: '跳板机',
+      kind: 'jump',
+      jumpHost: mergedJumpHost
     }
-    const accessRoutes = [
-      ...existingRoutes,
-      ...(existingRoutes.some((route) => route.host === mergedRoute.host && route.port === mergedRoute.port && route.username === mergedRoute.username)
-        ? []
-        : [mergedRoute])
-    ]
+    const accessRoutes = routeToReplace
+      ? existingRoutes.map((route) => route.id === routeToReplace.id ? mergedRoute : route)
+      : [...existingRoutes, mergedRoute]
     const baseSecrets = data.secrets[base.id] ? this.getSecrets(base.id) : {}
     const sourceSecrets = data.secrets[source.id] ? this.getSecrets(source.id) : {}
     const mergedSecrets: ServerSecrets = {
       password: baseSecrets.password ?? sourceSecrets.password,
       passphrase: baseSecrets.passphrase ?? sourceSecrets.passphrase,
-      jumpPassword: baseSecrets.jumpPassword ?? sourceSecrets.jumpPassword ?? sourceSecrets.password,
-      jumpPassphrase: baseSecrets.jumpPassphrase ?? sourceSecrets.jumpPassphrase ?? sourceSecrets.passphrase
+      jumpPassword: sourceSecrets.jumpPassword ?? (sameJumpHost ? baseSecrets.jumpPassword : undefined),
+      jumpPassphrase: sourceSecrets.jumpPassphrase ?? (sameJumpHost ? baseSecrets.jumpPassphrase : undefined)
     }
     if (Object.values(mergedSecrets).some(Boolean)) this.setSecrets(base.id, mergedSecrets)
+    else delete data.secrets[base.id]
     const mergedProfile: ServerProfile = {
       ...base,
       accessRoutes,
       defaultAccessRouteId: base.defaultAccessRouteId ?? 'direct',
-      jumpHost: base.jumpHost ?? mergedRoute.jumpHost,
-      hasSecret: Boolean(base.hasSecret || source.hasSecret || Object.values(mergedSecrets).some(Boolean)),
+      jumpHost: mergedRoute.jumpHost,
+      hasSecret: Boolean(base.hasSecret || baseSecrets.password || baseSecrets.passphrase || sourceSecrets.password || sourceSecrets.passphrase),
       updatedAt: now()
     }
     data.servers[baseIndex] = mergedProfile
@@ -326,6 +368,57 @@ export class AppStore {
     for (const key of Object.keys(data.gpuHistory)) {
       if (key.startsWith(`${source.id}::`)) delete data.gpuHistory[key]
     }
+    await this.persist()
+    return structuredClone(mergedProfile)
+  }
+
+  async mergeSshConfigJumpHost(serverId: string, inputJumpHost: NonNullable<ServerProfile['jumpHost']>, targetRouteId?: string): Promise<ServerProfile> {
+    const data = this.ensureData()
+    const index = data.servers.findIndex((item) => item.id === serverId)
+    if (index < 0) throw new Error('服务器不存在或已被删除')
+    const server = data.servers[index]
+    const routes = getAccessRoutes(server)
+    const directRoute = routes.find((route) => route.kind === 'direct') ?? routes[0]
+    if (!directRoute) throw new Error('服务器没有可合并的目标连接路径')
+    const existingJumpRoute = targetRouteId
+      ? routes.find((route) => route.id === targetRouteId && route.kind === 'jump')
+      : routes.find((route) => route.kind === 'jump')
+    if (targetRouteId && !existingJumpRoute) throw new Error('要更新的 SSH 跳板路径不存在或已被修改')
+    const previousJumpHost = existingJumpRoute?.jumpHost ?? server.jumpHost
+    const sameJumpHost = Boolean(previousJumpHost && previousJumpHost.host === inputJumpHost.host && previousJumpHost.port === inputJumpHost.port && previousJumpHost.username === inputJumpHost.username)
+    const jumpHost = {
+      ...inputJumpHost,
+      hostFingerprint: sameJumpHost ? previousJumpHost?.hostFingerprint : inputJumpHost.hostFingerprint,
+      hasSecret: sameJumpHost ? Boolean(previousJumpHost?.hasSecret || inputJumpHost.hasSecret) : Boolean(inputJumpHost.hasSecret)
+    }
+
+    if (!sameJumpHost && data.secrets[serverId]) {
+      const existingSecrets = this.getSecrets(serverId)
+      const retainedSecrets: ServerSecrets = {
+        password: existingSecrets.password,
+        passphrase: existingSecrets.passphrase
+      }
+      if (Object.values(retainedSecrets).some(Boolean)) this.setSecrets(serverId, retainedSecrets)
+      else delete data.secrets[serverId]
+    }
+
+    let routeId = existingJumpRoute?.id ?? 'ssh-config-jump'
+    while (!existingJumpRoute && routes.some((route) => route.id === routeId)) routeId = `${routeId}-1`
+    const mergedRoute: ServerAccessRoute = {
+      ...(existingJumpRoute ?? directRoute),
+      id: routeId,
+      name: '跳板机',
+      kind: 'jump',
+      jumpHost
+    }
+    const mergedProfile: ServerProfile = {
+      ...server,
+      jumpHost,
+      accessRoutes: [...routes.filter((route) => route.id !== existingJumpRoute?.id), mergedRoute],
+      defaultAccessRouteId: server.defaultAccessRouteId ?? 'direct',
+      updatedAt: now()
+    }
+    data.servers[index] = mergedProfile
     await this.persist()
     return structuredClone(mergedProfile)
   }
@@ -446,6 +539,227 @@ export class AppStore {
     this.ensureData().settings = settings
     await this.persist()
     return structuredClone(settings)
+  }
+
+  listExperimentTasks(): ExperimentTask[] {
+    return structuredClone(this.ensureData().experimentTasks)
+  }
+
+  async saveExperimentTask(rawInput: ExperimentTaskDraft): Promise<ExperimentTask> {
+    const input = experimentTaskDraftSchema.parse(rawInput)
+    for (const [label, path] of [['代码目录', input.codePath], ['数据目录', input.dataPath], ['产物路径', input.artifactPath]] as const) {
+      if (path && (!path.startsWith('/') || path.includes('\0'))) throw new Error(`${label}必须填写服务器上的绝对路径`)
+    }
+    const data = this.ensureData()
+    const existingIndex = input.id
+      ? data.experimentTasks.findIndex((task) => task.id === input.id)
+      : -1
+    if (input.id && existingIndex < 0) throw new Error('实验任务不存在或已被删除')
+    const existing = existingIndex >= 0 ? data.experimentTasks[existingIndex] : undefined
+    const server = input.serverId ? data.servers.find((item) => item.id === input.serverId) : undefined
+    if (input.serverId && !server && existing?.serverId !== input.serverId) throw new Error('所选服务器不存在或已被删除')
+    if (server && input.accessRouteId && !getAccessRoutes(server).some((route) => route.id === input.accessRouteId)) {
+      throw new Error('任务所选连接路径已不存在，请重新选择')
+    }
+    const timestamp = now()
+    const runs = structuredClone(existing?.runs ?? [])
+    const activeRunIndex = runs.findIndex((run) => run.status === 'queued' || run.status === 'preparing' || run.status === 'running')
+    if (activeRunIndex >= 0 && runs[activeRunIndex].status === 'queued') {
+      runs[activeRunIndex] = {
+        ...runs[activeRunIndex],
+        serverId: input.serverId,
+        serverNameSnapshot: server?.name ?? input.serverNameSnapshot,
+        accessRouteId: input.accessRouteId,
+        codePath: input.codePath,
+        dataPath: input.dataPath,
+        launchCommand: input.launchCommand,
+        condaEnvironment: input.condaEnvironment ? structuredClone(input.condaEnvironment) : undefined,
+        minimumFreeVramGiB: input.minimumFreeVramGiB,
+        artifactPath: input.artifactPath,
+        notes: input.notes
+      }
+    }
+    const task: ExperimentTask = experimentTaskSchema.parse({
+      ...input,
+      id: existing?.id ?? randomUUID(),
+      status: activeRunIndex >= 0 ? existing!.status : input.status,
+      serverNameSnapshot: server?.name ?? input.serverNameSnapshot,
+      createdAt: existing?.createdAt ?? timestamp,
+      updatedAt: timestamp,
+      archived: existing?.archived ?? false,
+      runs
+    })
+    if (existingIndex >= 0) data.experimentTasks[existingIndex] = task
+    else data.experimentTasks.unshift(task)
+    await this.persist()
+    return structuredClone(task)
+  }
+
+  async setExperimentTaskStatus(taskId: string, status: ExperimentTaskStatus): Promise<ExperimentTask> {
+    status = experimentTaskStatusSchema.parse(status)
+    const data = this.ensureData()
+    const index = data.experimentTasks.findIndex((task) => task.id === taskId)
+    if (index < 0) throw new Error('实验任务不存在或已被删除')
+    if (status === 'running' || status === 'queued' || status === 'preparing') throw new Error('请通过“加入队列”创建一次自动运行')
+    const task = data.experimentTasks[index]
+    const activeRunIndex = task.runs.findIndex((run) => run.status === 'queued' || run.status === 'preparing' || run.status === 'running')
+    const pausedOffset = [...task.runs].reverse().findIndex((run) => run.status === 'paused')
+    const latestPausedIndex = pausedOffset < 0 ? -1 : task.runs.length - 1 - pausedOffset
+    const targetRunIndex = activeRunIndex >= 0 ? activeRunIndex : task.status === 'paused' ? latestPausedIndex : -1
+    if (targetRunIndex >= 0) {
+      if (status === 'planned') throw new Error('请先记录或结束当前运行，再将任务设为待开始')
+      if (task.runs[targetRunIndex].status === 'queued' || task.runs[targetRunIndex].status === 'preparing') {
+        throw new Error('任务正在等待 GPU 或准备运行，请先移出队列')
+      }
+      if (status === 'paused') {
+        if (activeRunIndex >= 0) task.runs[activeRunIndex] = { ...task.runs[activeRunIndex], status: 'paused' }
+      } else if (status === 'completed' || status === 'cancelled') {
+        task.runs[targetRunIndex] = { ...task.runs[targetRunIndex], status, finishedAt: now() }
+      }
+    }
+    if (status === 'paused' && targetRunIndex < 0) throw new Error('没有可暂停的运行记录')
+    task.status = status
+    task.updatedAt = now()
+    await this.persist()
+    return structuredClone(task)
+  }
+
+  async startExperimentRun(taskId: string, rawInput: ExperimentRunStartInput): Promise<ExperimentTask> {
+    const input = experimentRunStartInputSchema.parse(rawInput)
+    const data = this.ensureData()
+    const index = data.experimentTasks.findIndex((task) => task.id === taskId)
+    if (index < 0) throw new Error('实验任务不存在或已被删除')
+    const task = data.experimentTasks[index]
+    if (task.archived) throw new Error('已归档的实验任务不能启动')
+    const activeIndex = task.runs.findIndex((run) => run.status === 'queued' || run.status === 'preparing' || run.status === 'running')
+    if (activeIndex >= 0) throw new Error('该任务已有正在运行的实验记录')
+    for (const [label, path] of [['代码目录', input.codePath], ['数据目录', input.dataPath], ['产物路径', input.artifactPath]] as const) {
+      if (path && (!path.startsWith('/') || path.includes('\0'))) throw new Error(`${label}必须填写服务器上的绝对路径`)
+    }
+    if (!input.serverId || !input.accessRouteId) throw new Error('开始记录前，请为本次运行选择服务器和连接路径')
+    if (!task.serverId || input.serverId !== task.serverId) throw new Error('任务必须在其指定服务器内调度，请先编辑任务的目标服务器')
+    const server = data.servers.find((item) => item.id === input.serverId)
+    if (!server) throw new Error('本次运行所选服务器不存在或已被删除')
+    if (server.mode !== 'real') throw new Error('演示服务器不能作为实验运行目标')
+    if (!getAccessRoutes(server).some((route) => route.id === input.accessRouteId)) {
+      throw new Error('本次运行所选连接路径已不存在，请重新选择')
+    }
+    if (input.condaEnvironment && Boolean(input.condaEnvironment.environmentName?.trim()) === Boolean(input.condaEnvironment.environmentPrefix?.trim())) {
+      throw new Error('本次 Conda 环境必须填写环境名或环境前缀路径其中一项')
+    }
+    if (!input.codePath.trim() || !input.codePath.trim().startsWith('/')) throw new Error('自动运行需要填写服务器上的代码目录绝对路径')
+    if (!input.launchCommand.trim()) throw new Error('自动运行需要填写启动命令')
+    const queuedAt = now()
+    const run: ExperimentRun = {
+      id: randomUUID(),
+      number: task.runs.reduce((maximum, item) => Math.max(maximum, item.number), 0) + 1,
+      status: 'queued',
+      queuedAt,
+      serverId: input.serverId,
+      serverNameSnapshot: server?.name,
+      accessRouteId: input.accessRouteId,
+      gpuUuid: undefined,
+      gpuIndex: undefined,
+      gpuNameSnapshot: undefined,
+      codePath: input.codePath,
+      dataPath: input.dataPath,
+      launchCommand: input.launchCommand,
+      condaEnvironment: input.condaEnvironment ? structuredClone(input.condaEnvironment) : undefined,
+      minimumFreeVramGiB: input.minimumFreeVramGiB,
+      artifactPath: input.artifactPath,
+      message: '正在等待指定服务器上的空闲 GPU',
+      resultSummary: '',
+      notes: input.notes
+    }
+    task.runs.push(run)
+    task.status = 'queued'
+    task.updatedAt = queuedAt
+    await this.persist()
+    return structuredClone(task)
+  }
+
+  async updateExperimentRunState(
+    taskId: string,
+    runId: string,
+    patch: Partial<Pick<ExperimentRun, 'status' | 'queuedAt' | 'startedAt' | 'finishedAt' | 'message' | 'gpuUuid' | 'gpuIndex' | 'gpuNameSnapshot' | 'minimumFreeVramGiB' | 'remotePid' | 'remoteRunDir' | 'logPath' | 'condaEnvironment'>>,
+    expectedStatus?: ExperimentRun['status']
+  ): Promise<ExperimentTask> {
+    const data = this.ensureData()
+    const task = data.experimentTasks.find((item) => item.id === taskId)
+    if (!task) throw new Error('实验任务不存在或已被删除')
+    const index = task.runs.findIndex((item) => item.id === runId)
+    if (index < 0) throw new Error('实验运行记录不存在')
+    const current = task.runs[index]
+    if (expectedStatus && current.status !== expectedStatus) return structuredClone(task)
+    const updated = { ...current, ...patch }
+    task.runs[index] = updated
+    const hasActiveRun = task.runs.some((item) => item.status === 'queued' || item.status === 'preparing' || item.status === 'running')
+    if (patch.status && (current.status === 'queued' || current.status === 'preparing' || current.status === 'running' || !hasActiveRun)) {
+      task.status = patch.status
+    }
+    task.updatedAt = now()
+    await this.persist()
+    return structuredClone(task)
+  }
+
+  async cancelQueuedExperimentRun(taskId: string, runId: string): Promise<ExperimentTask> {
+    const task = this.ensureData().experimentTasks.find((item) => item.id === taskId)
+    const run = task?.runs.find((item) => item.id === runId)
+    if (!task || !run) throw new Error('实验运行记录不存在')
+    if (run.status !== 'queued') throw new Error('任务已开始准备，当前不能移出队列')
+    return this.updateExperimentRunState(taskId, runId, {
+      status: 'cancelled',
+      finishedAt: now(),
+      message: '用户已将任务移出队列'
+    })
+  }
+
+  async finishExperimentRun(taskId: string, runId: string, input: ExperimentRunFinishInput): Promise<ExperimentTask> {
+    input = experimentRunFinishInputSchema.parse(input)
+    const data = this.ensureData()
+    const index = data.experimentTasks.findIndex((task) => task.id === taskId)
+    if (index < 0) throw new Error('实验任务不存在或已被删除')
+    const task = data.experimentTasks[index]
+    const runIndex = task.runs.findIndex((run) => run.id === runId)
+    if (runIndex < 0) throw new Error('实验运行记录不存在')
+    const finishInput = {
+      status: input.status,
+      resultSummary: input.resultSummary.trim().slice(0, 4000),
+      notes: input.notes.trim().slice(0, 8000),
+      artifactPath: input.artifactPath.trim().slice(0, 4096)
+    }
+    if (finishInput.artifactPath && (!finishInput.artifactPath.startsWith('/') || finishInput.artifactPath.includes('\0'))) {
+      throw new Error('日志/模型路径必须是服务器上的绝对路径')
+    }
+    const run = task.runs[runIndex]
+    if (run.status !== 'running' && run.status !== 'paused') throw new Error('只有运行中或已暂停的记录可以手动结束')
+    task.runs[runIndex] = {
+      ...run,
+      ...finishInput,
+      ...(input.status === 'paused' ? {} : { finishedAt: now() })
+    }
+    if (run.status === 'running' || !task.runs.some((item) => item.status === 'queued' || item.status === 'preparing' || item.status === 'running')) {
+      task.status = input.status === 'paused' ? 'paused' : input.status
+    }
+    task.resultSummary = finishInput.resultSummary
+    task.artifactPath = finishInput.artifactPath || task.artifactPath
+    task.updatedAt = now()
+    await this.persist()
+    return structuredClone(task)
+  }
+
+  async setExperimentTaskArchived(taskId: string, archived: boolean): Promise<ExperimentTask> {
+    const data = this.ensureData()
+    const index = data.experimentTasks.findIndex((task) => task.id === taskId)
+    if (index < 0) throw new Error('实验任务不存在或已被删除')
+    const task = data.experimentTasks[index]
+    if (archived && task.status !== 'completed' && task.status !== 'failed' && task.status !== 'cancelled') {
+      throw new Error('请先完成或取消任务，再归档')
+    }
+    task.archived = archived
+    task.updatedAt = now()
+    await this.persist()
+    return structuredClone(task)
   }
 
   private setSecrets(id: string, secrets: ServerSecrets): void {

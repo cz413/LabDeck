@@ -1,7 +1,7 @@
 import { execFile, spawn } from 'node:child_process'
 import { access, mkdir, readFile, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { dirname, join, posix } from 'node:path'
 import { promisify } from 'node:util'
 import type { ServerProfile, VsCodeRemoteResult } from '../shared/types'
 import { getAccessRoutes, getDefaultAccessRouteId } from '../shared/access-routes'
@@ -134,7 +134,7 @@ export class VsCodeService {
 
   constructor(private readonly store: AppStore) {}
 
-  async openRemote(server: ServerProfile, accessRouteId?: string): Promise<VsCodeRemoteResult> {
+  async openRemote(server: ServerProfile, accessRouteId?: string, remotePath?: string): Promise<VsCodeRemoteResult> {
     if (process.platform !== 'win32') throw new Error('一键打开 VS Code 目前仅支持 Windows')
     if (server.mode !== 'real') throw new Error('演示节点没有可连接的远程主机')
 
@@ -146,11 +146,16 @@ export class VsCodeService {
     const previousAlias = legacyJump
       ? vscodeSshAlias(server.id)
       : vscodeRouteSshAlias(server.id, routeId)
-    if (await this.focusExistingWindow(alias, previousAlias)) {
+    if (remotePath !== undefined && (typeof remotePath !== 'string' || !remotePath.startsWith('/') || remotePath.includes('\0'))) {
+      throw new Error('VS Code 远程目录必须是绝对路径')
+    }
+    const normalizedRemotePath = remotePath ? posix.normalize(remotePath) : undefined
+    if (!normalizedRemotePath && await this.focusExistingWindow(alias, previousAlias)) {
       return { status: 'focused', message: `${server.name} 的 VS Code 远程窗口已切到前台` }
     }
 
-    const lastLaunch = launchingTargets.get(alias) ?? 0
+    const launchKey = normalizedRemotePath ? `${alias}:${normalizedRemotePath}` : alias
+    const lastLaunch = launchingTargets.get(launchKey) ?? 0
     if (Date.now() - lastLaunch < launchCooldownMs) {
       return { status: 'launching', message: `${server.name} 的 VS Code 远程窗口正在启动` }
     }
@@ -159,8 +164,15 @@ export class VsCodeService {
     await this.ensureRemoteSshExtension(codeCli)
     await this.updateSshConfig()
 
-    launchingTargets.set(alias, Date.now())
-    const child = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', buildWindowsCommand(codeCli, ['--new-window', '--remote', `ssh-remote+${alias}`])], {
+    launchingTargets.set(launchKey, Date.now())
+    const encodedRemotePath = normalizedRemotePath === '/' ? '/' : normalizedRemotePath?.split('/').map((part) => encodeURIComponent(part)).join('/')
+    const remoteTarget = normalizedRemotePath
+      ? `vscode-remote://ssh-remote+${alias}${encodedRemotePath}`
+      : undefined
+    const args = remoteTarget
+      ? ['--new-window', '--folder-uri', remoteTarget]
+      : ['--new-window', '--remote', `ssh-remote+${alias}`]
+    const child = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', buildWindowsCommand(codeCli, args)], {
       detached: true,
       stdio: 'ignore',
       windowsHide: false,
@@ -170,13 +182,15 @@ export class VsCodeService {
       child.once('spawn', resolveLaunch)
       child.once('error', rejectLaunch)
     }).catch((error) => {
-      launchingTargets.delete(alias)
+      launchingTargets.delete(launchKey)
       throw new Error(`无法启动 Visual Studio Code：${error instanceof Error ? error.message : String(error)}`)
     })
     child.unref()
     return {
       status: 'launched',
-      message: `正在用 VS Code 连接 ${server.name}`
+      message: normalizedRemotePath
+        ? `正在用 VS Code 打开 ${server.name} 上的 ${normalizedRemotePath}`
+        : `正在用 VS Code 连接 ${server.name}`
     }
   }
 

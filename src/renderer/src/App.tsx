@@ -15,6 +15,7 @@ import {
   FileDown,
   GitMerge,
   Gauge,
+  GripVertical,
   HardDrive,
   LayoutDashboard,
   ListTodo,
@@ -37,18 +38,18 @@ import {
   Zap,
   XCircle
 } from 'lucide-react'
-import type { AppSettings, ConnectionTestResult, GpuProcessMetric, GpuWatchTarget, MonitorPolicy, ServerProfile, ServerSnapshot } from '@shared/types'
+import type { AppSettings, ConnectionTestResult, ExperimentTask, GpuProcessMetric, GpuWatchTarget, MonitorPolicy, ServerProfile, ServerSnapshot } from '@shared/types'
 import { gpuLoadState, gpuMemoryPercent, gpuRecommendation, isGpuBusy } from '@shared/gpu-status'
 import { getAccessRoute, getAccessRoutes, getDefaultAccessRouteId, routeLabel } from '@shared/access-routes'
 import { ServerDialog } from './components/ServerDialog'
 import { AccessRouteSelect } from './components/AccessRouteSelect'
 import { GpuDetailPanel } from './components/GpuDetailPanel'
-import { LocalTerminalWorkspace } from './components/LocalTerminalWorkspace'
-import { ServerTerminalWorkspace, type ServerTerminalSession } from './components/ServerTerminalWorkspace'
+import { ServerTerminalWorkspace, type ServerTerminalSession, type TerminalWorkspaceSession } from './components/ServerTerminalWorkspace'
 import { ServerDetailPage } from './components/ServerDetailPage'
+import { ConfirmDialog, type ConfirmationRequest } from './components/ConfirmDialog'
+import { ExperimentTaskPool } from './components/ExperimentTaskPool'
 
 type Page = 'dashboard' | 'gpus' | 'tasks' | 'servers' | 'serverDetail' | 'terminals' | 'alerts' | 'settings'
-type Workspace = { type: 'localTerminal' } | null
 type GpuSelection = { server: ServerProfile; gpuIndex: number } | null
 
 interface UserGpuTask {
@@ -67,11 +68,12 @@ interface Toast {
 const defaultSettings: AppSettings = {
   theme: 'ocean',
   monitoringEnabled: true,
-  pollingIntervalSeconds: 60,
+  pollingIntervalSeconds: 30,
   maxConcurrentPolls: 5,
   minimizeToTray: true,
   closeBehavior: 'ask',
   notifyOnWarning: true,
+  serverOrder: [],
   gpuWatches: []
 }
 
@@ -122,28 +124,34 @@ function LabDeckMark(): React.JSX.Element {
 export function App(): React.JSX.Element {
   const [page, setPage] = useState<Page>('dashboard')
   const [servers, setServers] = useState<ServerProfile[]>([])
+  const [experimentTasks, setExperimentTasks] = useState<ExperimentTask[]>([])
   const [snapshots, setSnapshots] = useState<Record<string, ServerSnapshot>>({})
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
   const [refreshing, setRefreshing] = useState(false)
   const [dialogServer, setDialogServer] = useState<ServerProfile | null | undefined>(undefined)
-  const [workspace, setWorkspace] = useState<Workspace>(null)
-  const [terminalSessions, setTerminalSessions] = useState<ServerTerminalSession[]>([])
+  const [terminalSessions, setTerminalSessions] = useState<TerminalWorkspaceSession[]>([])
   const [activeTerminalSessionId, setActiveTerminalSessionId] = useState<string | null>(null)
+  const [pendingConfirmation, setPendingConfirmation] = useState<ConfirmationRequest | null>(null)
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null)
   const [gpuSelection, setGpuSelection] = useState<GpuSelection>(null)
   const [testingId, setTestingId] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [vscodeConnectingId, setVsCodeConnectingId] = useState<string | null>(null)
   const [settings, setSettings] = useState<AppSettings>(defaultSettings)
-  const [sshConfigCount, setSshConfigCount] = useState(0)
   const [importingConfig, setImportingConfig] = useState(false)
+  const [draggedShortcutServerId, setDraggedShortcutServerId] = useState<string | null>(null)
+  const [dragOverShortcutServerId, setDragOverShortcutServerId] = useState<string | null>(null)
   const [windowMaximized, setWindowMaximized] = useState(false)
   const [closePromptOpen, setClosePromptOpen] = useState(false)
   const [rememberCloseChoice, setRememberCloseChoice] = useState(false)
   const [accessRouteSelections, setAccessRouteSelections] = useState<Record<string, string>>({})
   const retryState = useRef<Record<string, { failures: number; nextRetryAt: number }>>({})
+  const snapshotRefreshInFlight = useRef(false)
+  const pendingForcedSnapshots = useRef<Map<string, ServerProfile>>(new Map())
   const nextTerminalNumber = useRef(1)
+  const nextLocalTerminalNumber = useRef(1)
+  const confirmationResolver = useRef<((confirmed: boolean) => void) | null>(null)
   const previousPage = useRef<Page>('dashboard')
   const serverDetailReturnPage = useRef<Page>('dashboard')
 
@@ -174,6 +182,19 @@ export function App(): React.JSX.Element {
     window.setTimeout(() => setToasts((current) => current.filter((toast) => toast.id !== id)), 3600)
   }
 
+  const requestConfirmation = (request: ConfirmationRequest): Promise<boolean> => new Promise((resolve) => {
+    confirmationResolver.current?.(false)
+    confirmationResolver.current = resolve
+    setPendingConfirmation(request)
+  })
+
+  const settleConfirmation = (confirmed: boolean): void => {
+    const resolve = confirmationResolver.current
+    confirmationResolver.current = null
+    setPendingConfirmation(null)
+    resolve?.(confirmed)
+  }
+
   const loadServers = async (): Promise<ServerProfile[]> => {
     const list = await window.labApi.servers.list()
     setServers(list)
@@ -184,11 +205,18 @@ export function App(): React.JSX.Element {
     list = servers,
     options: { force?: boolean; concurrency?: number } = {}
   ): Promise<void> => {
+    if (snapshotRefreshInFlight.current) {
+      if (options.force) {
+        for (const server of list) pendingForcedSnapshots.current.set(server.id, server)
+      }
+      return
+    }
     const now = Date.now()
     const eligible = options.force
       ? list
       : list.filter((server) => (retryState.current[server.id]?.nextRetryAt ?? 0) <= now)
     if (!eligible.length) return
+    snapshotRefreshInFlight.current = true
     setRefreshing(true)
     let nextIndex = 0
     const worker = async (): Promise<void> => {
@@ -213,37 +241,38 @@ export function App(): React.JSX.Element {
         }
       }
     }
-    await Promise.allSettled(
-      Array.from(
-        { length: Math.min(options.concurrency ?? settings.maxConcurrentPolls, eligible.length) },
-        () => worker()
+    try {
+      await Promise.allSettled(
+        Array.from(
+          { length: Math.min(options.concurrency ?? settings.maxConcurrentPolls, eligible.length) },
+          () => worker()
+        )
       )
-    )
-    setRefreshing(false)
+    } finally {
+      snapshotRefreshInFlight.current = false
+      setRefreshing(false)
+      const pendingForced = [...pendingForcedSnapshots.current.values()]
+      pendingForcedSnapshots.current.clear()
+      if (pendingForced.length) {
+        window.setTimeout(() => void refreshSnapshots(pendingForced, { force: true }), 0)
+      }
+    }
   }
 
   useEffect(() => {
     void (async () => {
       try {
-        const [list, savedSettings, cachedSnapshots] = await Promise.all([
+        const [, savedSettings, cachedSnapshots, savedExperimentTasks] = await Promise.all([
           loadServers(),
           window.labApi.settings.get(),
-          window.labApi.monitor.cachedSnapshots()
+          window.labApi.monitor.cachedSnapshots(),
+          window.labApi.experiments.list()
         ])
         setSettings(savedSettings)
         setSnapshots(cachedSnapshots)
+        setExperimentTasks(savedExperimentTasks)
         document.documentElement.dataset.theme = savedSettings.theme
         setLoading(false)
-        const watchedServerIds = new Set(savedSettings.gpuWatches.map((watch) => watch.serverId))
-        const backgroundServers = list.filter((server) => server.monitorPolicy === 'background' || watchedServerIds.has(server.id))
-        if (savedSettings.monitoringEnabled && backgroundServers.length) {
-          window.setTimeout(() => void refreshSnapshots(backgroundServers, { concurrency: savedSettings.maxConcurrentPolls }), 0)
-        }
-        void window.labApi.sshConfig.scan().then((scan) => {
-          setSshConfigCount(scan.candidates.filter((item) => !item.alreadyImported).length)
-        }).catch(() => {
-          setSshConfigCount(0)
-        })
       } catch (error) {
         notify(error instanceof Error ? error.message : '应用初始化失败', 'error')
         setLoading(false)
@@ -251,21 +280,31 @@ export function App(): React.JSX.Element {
     })()
   }, [])
 
+  useEffect(() => window.labApi.experiments.onChanged(() => {
+    void window.labApi.experiments.list().then(setExperimentTasks).catch((error: unknown) => {
+      console.warn('刷新实验任务状态失败', error)
+    })
+  }), [])
+
   useEffect(() => {
     const watchedServerIds = new Set(settings.gpuWatches.map((watch) => watch.serverId))
     const backgroundServers = servers.filter((server) => server.monitorPolicy === 'background' || watchedServerIds.has(server.id))
     if (!settings.monitoringEnabled || !backgroundServers.length) return
-    const timer = window.setInterval(
-      () => void refreshSnapshots(backgroundServers),
-      settings.pollingIntervalSeconds * 1000
-    )
-    return () => window.clearInterval(timer)
+    const intervalMs = settings.pollingIntervalSeconds * 1000
+    let intervalTimer: number | undefined
+    const initialTimer = window.setTimeout(() => {
+      void refreshSnapshots(backgroundServers)
+      intervalTimer = window.setInterval(() => void refreshSnapshots(backgroundServers), intervalMs)
+    }, Math.floor(Math.random() * intervalMs))
+    return () => {
+      window.clearTimeout(initialTimer)
+      if (intervalTimer !== undefined) window.clearInterval(intervalTimer)
+    }
   }, [settings.monitoringEnabled, settings.pollingIntervalSeconds, settings.maxConcurrentPolls, settings.gpuWatches, servers, accessRouteSelections])
 
   useEffect(() => window.labApi.notifications.onGpuAvailable((event) => {
     const server = servers.find((item) => item.id === event.serverId)
     if (!server) return
-    setWorkspace(null)
     setPage('gpus')
     setGpuSelection({ server, gpuIndex: event.gpuIndex })
   }), [servers])
@@ -298,6 +337,34 @@ export function App(): React.JSX.Element {
         .includes(query)
     )
   }, [search, servers])
+
+  const orderedShortcutServers = useMemo(() => {
+    const positions = new Map(settings.serverOrder.map((serverId, index) => [serverId, index]))
+    return [...servers].sort((left, right) => (positions.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (positions.get(right.id) ?? Number.MAX_SAFE_INTEGER))
+  }, [servers, settings.serverOrder])
+
+  const startShortcutDrag = (event: React.DragEvent<HTMLButtonElement>, server: ServerProfile): void => {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', server.id)
+    setDraggedShortcutServerId(server.id)
+  }
+
+  const dropShortcutServer = (event: React.DragEvent<HTMLButtonElement>, target: ServerProfile): void => {
+    event.preventDefault()
+    const sourceId = event.dataTransfer.getData('text/plain') || draggedShortcutServerId
+    if (sourceId && sourceId !== target.id) {
+      const next = [...orderedShortcutServers]
+      const sourceIndex = next.findIndex((server) => server.id === sourceId)
+      const targetIndex = next.findIndex((server) => server.id === target.id)
+      if (sourceIndex >= 0 && targetIndex >= 0) {
+        const [moved] = next.splice(sourceIndex, 1)
+        next.splice(targetIndex, 0, moved)
+        void saveServerOrder(next.map((server) => server.id))
+      }
+    }
+    setDraggedShortcutServerId(null)
+    setDragOverShortcutServerId(null)
+  }
 
   const selectedServer = selectedServerId
     ? servers.find((server) => server.id === selectedServerId)
@@ -350,22 +417,25 @@ export function App(): React.JSX.Element {
     notify('服务器配置已保存')
   }
 
-  const openSftp = (server: ServerProfile, accessRouteId = accessRouteIdFor(server)): void => {
+  const openSftp = (server: ServerProfile, accessRouteId = accessRouteIdFor(server), initialPath?: string): void => {
     if (routeNeedsSecret(server, accessRouteId)) {
       notify('请先在服务器认证信息中输入并保存 SSH 密码', 'error')
       setDialogServer(server)
       return
     }
-    void window.labApi.sftp.openWindow(server.id, accessRouteId).catch((error: unknown) => {
+    const route = getAccessRoute(server, accessRouteId)
+    const defaultPath = `/home/${route.username.trim() || 'user'}`
+    const targetPath = initialPath?.startsWith('/') ? initialPath : defaultPath
+    void window.labApi.sftp.openWindow(server.id, accessRouteId, targetPath).catch((error: unknown) => {
       notify(error instanceof Error ? error.message : '无法打开文件传输窗口', 'error')
     })
   }
 
-  const openVsCode = async (server: ServerProfile, accessRouteId = accessRouteIdFor(server)): Promise<void> => {
+  const openVsCode = async (server: ServerProfile, accessRouteId = accessRouteIdFor(server), remotePath?: string): Promise<void> => {
     if (vscodeConnectingId === server.id) return
     setVsCodeConnectingId(server.id)
     try {
-      const result = await window.labApi.vscode.openRemote(server.id, accessRouteId)
+      const result = await window.labApi.vscode.openRemote(server.id, accessRouteId, remotePath)
       notify(result.message)
     } catch (error) {
       notify(error instanceof Error ? error.message : '无法打开 VS Code 远程连接', 'error')
@@ -374,16 +444,73 @@ export function App(): React.JSX.Element {
     }
   }
 
-  const createTerminalSession = (server: ServerProfile, accessRouteId: string): ServerTerminalSession => {
+  const createTerminalSession = (server: ServerProfile, accessRouteId: string, workingDirectory?: string, initialCommand?: string, taskTitle?: string): ServerTerminalSession => {
     const session = {
       id: crypto.randomUUID(),
-      name: `SSH ${nextTerminalNumber.current++}`,
+      name: taskTitle ? `实验 · ${taskTitle}` : `SSH ${nextTerminalNumber.current++}`,
+      type: 'server' as const,
       server,
-      accessRouteId
+      accessRouteId,
+      currentPath: workingDirectory?.startsWith('/') ? workingDirectory : `/home/${getAccessRoute(server, accessRouteId).username.trim() || 'user'}`,
+      initialCommand
     }
     setTerminalSessions((current) => [...current, session])
     setActiveTerminalSessionId(session.id)
     return session
+  }
+
+  const openExperimentTerminal = (
+    server: ServerProfile,
+    requestedRouteId: string,
+    remotePath?: string,
+    initialCommand?: string,
+    label?: string
+  ): boolean => {
+    if (server.mode !== 'real') {
+      notify('演示服务器不支持实验终端', 'error')
+      return false
+    }
+    const accessRouteId = requestedRouteId && getAccessRoutes(server).some((route) => route.id === requestedRouteId)
+      ? requestedRouteId
+      : accessRouteIdFor(server)
+    if (routeNeedsSecret(server, accessRouteId)) {
+      notify('请先在服务器认证信息中输入并保存 SSH 密码', 'error')
+      setDialogServer(server)
+      return false
+    }
+    const session = createTerminalSession(server, accessRouteId, remotePath, initialCommand, label)
+    setActiveTerminalSessionId(session.id)
+    setSelectedServerId(server.id)
+    setPage('terminals')
+    return true
+  }
+
+  const updateExperimentTask = (task: ExperimentTask): void => {
+    setExperimentTasks((current) => {
+      const index = current.findIndex((item) => item.id === task.id)
+      if (index < 0) return [task, ...current]
+      return current.map((item) => item.id === task.id ? task : item)
+    })
+  }
+
+  const addLocalTerminalSession = (): void => {
+    const session = {
+      id: crypto.randomUUID(),
+      name: `本地终端 ${nextLocalTerminalNumber.current++}`,
+      type: 'local' as const
+    }
+    setTerminalSessions((current) => [...current, session])
+    setActiveTerminalSessionId(session.id)
+    setPage('terminals')
+  }
+
+  const updateTerminalWorkingDirectory = (sessionId: string, path: string): void => {
+    if (!path.startsWith('/')) return
+    setTerminalSessions((current) => current.map((session) =>
+      session.id === sessionId && session.type === 'server' && session.currentPath !== path
+        ? { ...session, currentPath: path }
+        : session
+    ))
   }
 
   const openServerTerminal = (server: ServerProfile): void => {
@@ -394,36 +521,38 @@ export function App(): React.JSX.Element {
       return
     }
     const existing = terminalSessions.find((session) =>
-      session.server.id === server.id && session.accessRouteId === accessRouteId
+      session.type === 'server' && session.server.id === server.id && session.accessRouteId === accessRouteId
     )
     const session = existing ?? createTerminalSession(server, accessRouteId)
     setActiveTerminalSessionId(session.id)
-    setWorkspace(null)
     setSelectedServerId(server.id)
     setPage('terminals')
   }
 
-  const addTerminalSession = (server: ServerProfile): void => {
-    const accessRouteId = accessRouteIdFor(server)
+  const addTerminalSession = (server: ServerProfile, accessRouteId = accessRouteIdFor(server)): void => {
     if (routeNeedsSecret(server, accessRouteId)) {
       notify('请先在服务器认证信息中输入并保存 SSH 密码', 'error')
       setDialogServer(server)
       return
     }
     createTerminalSession(server, accessRouteId)
-    setWorkspace(null)
     setSelectedServerId(server.id)
     setPage('terminals')
   }
 
-  const closeTerminalSession = (sessionId: string): void => {
+  const closeTerminalSession = async (sessionId: string): Promise<void> => {
     const sessionIndex = terminalSessions.findIndex((session) => session.id === sessionId)
     if (sessionIndex < 0) return
     const session = terminalSessions[sessionIndex]
-    const shouldClose = window.confirm(
-      `关闭 ${session.server.name} 的 ${session.name}？\n\n这会断开 SSH，可能中断正在运行的前台命令。`
-    )
-    if (!shouldClose) return
+    if (session.type === 'server') {
+      const shouldClose = await requestConfirmation({
+        title: '关闭 SSH 会话？',
+        message: `关闭“${session.server.name}”的 ${session.name} 会断开 SSH，可能中断正在运行的前台命令。`,
+        confirmLabel: '关闭会话',
+        tone: 'danger'
+      })
+      if (!shouldClose) return
+    }
     setTerminalSessions((current) => current.filter((item) => item.id !== sessionId))
     if (activeTerminalSessionId === sessionId) {
       const nextSession = terminalSessions[sessionIndex + 1] ?? terminalSessions[sessionIndex - 1]
@@ -433,7 +562,6 @@ export function App(): React.JSX.Element {
 
   const openServerDetail = (server: ServerProfile): void => {
     if (page !== 'serverDetail') serverDetailReturnPage.current = page
-    setWorkspace(null)
     setSelectedServerId(server.id)
     setPage('serverDetail')
     if (server.monitorPolicy === 'onView') void refreshSnapshots([server], { force: true })
@@ -446,9 +574,11 @@ export function App(): React.JSX.Element {
       let result: ConnectionTestResult = await window.labApi.servers.test(server.id, accessRouteId)
       for (let attempt = 0; attempt < 2 && result.status === 'host-key-required' && result.fingerprint; attempt += 1) {
         const targetName = result.hostKeyTarget === 'jumpHost' ? '跳板机' : '目标服务器'
-        const trusted = window.confirm(
-          `首次连接 ${server.name} 的${targetName}，请通过可信渠道核对主机指纹：\n\n${result.fingerprint}\n\n确认信任该主机吗？`
-        )
+        const trusted = await requestConfirmation({
+          title: '信任 SSH 主机指纹？',
+          message: `首次连接 ${server.name} 的${targetName}。请通过可信渠道核对以下指纹后再继续：\n\n${result.fingerprint}`,
+          confirmLabel: '信任并继续'
+        })
         if (!trusted) break
         await window.labApi.servers.trustHost(server.id, result.fingerprint, result.hostKeyTarget, accessRouteId)
         await loadServers()
@@ -476,7 +606,12 @@ export function App(): React.JSX.Element {
       notify(`没有找到与“${source.name}”对应的主服务器记录`, 'error')
       return
     }
-    if (!window.confirm(`将“${source.name}”作为“${target.name}”的备用连接路径并移除重复卡片？\n\n目标服务器、监控历史和 GPU 任务会保留；${source.name} 的地址会作为“跳板机”保存。`)) return
+    const shouldMerge = await requestConfirmation({
+      title: '合并 SSH 跳板路径？',
+      message: `将“${source.name}”的路径目标地址、端口、用户名、认证方式和私钥路径合并到“${target.name}”。合并时会重新读取 SSH Config，解析 ProxyJump 或 ssh -W %h:%p jumpserver 形式的 ProxyCommand，并写入真正跳板机的地址、端口、用户名和私钥；解析失败时不会执行合并。主服务器地址、连接凭据和监控历史会保留。`,
+      confirmLabel: '合并路径'
+    })
+    if (!shouldMerge) return
     try {
       await window.labApi.servers.mergeAccessRoute(target.id, source.id)
       await loadServers()
@@ -484,21 +619,31 @@ export function App(): React.JSX.Element {
         setSelectedServerId(target.id)
         setPage('serverDetail')
       }
-      notify(`已将“${source.name}”合并为“${target.name}”的连接路径`)
+      notify(`已将“${source.name}”的 SSH 路径合并到“${target.name}”`)
     } catch (error) {
       notify(error instanceof Error ? error.message : '合并连接路径失败', 'error')
     }
   }
 
   const removeServer = async (server: ServerProfile): Promise<void> => {
-    if (!window.confirm(`确定删除“${server.name}”吗？本机保存的该服务器凭据也会被删除。`)) return
+    const shouldRemove = await requestConfirmation({
+      title: '删除服务器？',
+      message: `删除“${server.name}”后，本机保存的该服务器凭据也会一并删除。`,
+      confirmLabel: '删除服务器',
+      tone: 'danger'
+    })
+    if (!shouldRemove) return
     await window.labApi.servers.remove(server.id)
     if (selectedServerId === server.id) {
       setSelectedServerId(null)
       setPage('servers')
     }
     setServers((current) => current.filter((item) => item.id !== server.id))
-    setSettings((current) => ({ ...current, gpuWatches: current.gpuWatches.filter((watch) => watch.serverId !== server.id) }))
+    setSettings((current) => ({
+      ...current,
+      gpuWatches: current.gpuWatches.filter((watch) => watch.serverId !== server.id),
+      serverOrder: current.serverOrder.filter((serverId) => serverId !== server.id)
+    }))
     setSnapshots((current) => {
       const next = { ...current }
       delete next[server.id]
@@ -513,6 +658,24 @@ export function App(): React.JSX.Element {
       notify('设置已保存')
     } catch (error) {
       notify(error instanceof Error ? error.message : '设置保存失败', 'error')
+    }
+  }
+
+  const saveServerOrder = async (visibleOrder: string[]): Promise<void> => {
+    const visibleIds = new Set(visibleOrder)
+    const knownOrder = [...new Set([...settings.serverOrder, ...servers.map((server) => server.id)])]
+    let visibleIndex = 0
+    const nextOrder = knownOrder.map((serverId) => visibleIds.has(serverId) ? visibleOrder[visibleIndex++] : serverId)
+    for (const serverId of visibleOrder) {
+      if (!nextOrder.includes(serverId)) nextOrder.push(serverId)
+    }
+    const nextSettings = { ...settings, serverOrder: nextOrder }
+    setSettings((current) => ({ ...current, serverOrder: nextOrder }))
+    try {
+      await window.labApi.settings.save(nextSettings)
+    } catch (error) {
+      setSettings((current) => ({ ...current, serverOrder: settings.serverOrder }))
+      notify(error instanceof Error ? error.message : '服务器卡片顺序保存失败', 'error')
     }
   }
 
@@ -545,12 +708,21 @@ export function App(): React.JSX.Element {
     setImportingConfig(true)
     try {
       const result = await window.labApi.sshConfig.importAll()
-      await loadServers()
-      setSshConfigCount(0)
+      const importedServers = await loadServers()
+      const demoServers = importedServers.filter((server) => server.mode === 'demo')
+      if (demoServers.length) {
+        await Promise.all(demoServers.map((server) => window.labApi.servers.remove(server.id)))
+        await loadServers()
+        setSettings((current) => ({
+          ...current,
+          serverOrder: current.serverOrder.filter((serverId) => !demoServers.some((server) => server.id === serverId)),
+          gpuWatches: current.gpuWatches.filter((watch) => !demoServers.some((server) => server.id === watch.serverId))
+        }))
+      }
       if (result.imported.length) {
-        notify(`已从 ${result.configPath} 导入 ${result.imported.length} 台服务器`)
+        notify(`已从 ${result.configPath} 导入或合并 ${result.imported.length} 台服务器${demoServers.length ? `，已清除 ${demoServers.length} 个演示节点` : ''}`)
       } else {
-        notify(result.skipped.length ? 'SSH Config 中的服务器均已导入' : '未发现可导入的具体 Host', 'error')
+        notify(result.skipped.length ? `SSH Config 中的服务器均已导入${demoServers.length ? `，已清除 ${demoServers.length} 个演示节点` : ''}` : `未发现可导入的具体 Host${demoServers.length ? `，已清除 ${demoServers.length} 个演示节点` : ''}`, 'error')
       }
     } catch (error) {
       notify(error instanceof Error ? error.message : 'SSH Config 导入失败', 'error')
@@ -561,7 +733,6 @@ export function App(): React.JSX.Element {
 
   const goToPage = (nextPage: Page): void => {
     setPage(nextPage)
-    if (workspace?.type === 'localTerminal') setWorkspace(null)
   }
 
   const resolveCloseAction = async (action: 'tray' | 'exit' | 'cancel'): Promise<void> => {
@@ -583,21 +754,20 @@ export function App(): React.JSX.Element {
         </div>
         <nav>
           <div className="nav-caption">工作区</div>
-          <NavButton active={workspace?.type !== 'localTerminal' && page === 'dashboard'} icon={<LayoutDashboard size={18} />} label="运行总览" onClick={() => goToPage('dashboard')} />
-          <NavButton active={workspace?.type !== 'localTerminal' && page === 'gpus'} icon={<Cpu size={18} />} label="GPU 资源" badge={summary.gpuCount} onClick={() => goToPage('gpus')} />
-          <NavButton active={workspace?.type !== 'localTerminal' && (page === 'servers' || page === 'serverDetail')} icon={<ServerIcon size={18} />} label="服务器" badge={servers.length} onClick={() => goToPage('servers')} />
-          <NavButton active={workspace?.type !== 'localTerminal' && page === 'tasks'} icon={<ListTodo size={18} />} label="我的任务" badge={myTasks.length} onClick={() => goToPage('tasks')} />
-          <NavButton active={workspace?.type !== 'localTerminal' && page === 'terminals'} icon={<SquareTerminal size={18} />} label="SSH 终端" badge={terminalSessions.length || undefined} onClick={() => goToPage('terminals')} />
-          <NavButton active={workspace?.type === 'localTerminal'} icon={<SquareTerminal size={18} />} label="本地终端" onClick={() => setWorkspace({ type: 'localTerminal' })} />
+          <NavButton active={page === 'dashboard'} icon={<LayoutDashboard size={18} />} label="运行总览" onClick={() => goToPage('dashboard')} />
+          <NavButton active={page === 'gpus'} icon={<Cpu size={18} />} label="GPU 资源" badge={summary.gpuCount} onClick={() => goToPage('gpus')} />
+          <NavButton active={page === 'servers' || page === 'serverDetail'} icon={<ServerIcon size={18} />} label="服务器" badge={servers.length} onClick={() => goToPage('servers')} />
+          <NavButton active={page === 'tasks'} icon={<ListTodo size={18} />} label="我的任务" badge={myTasks.length} onClick={() => goToPage('tasks')} />
+          <NavButton active={page === 'terminals'} icon={<SquareTerminal size={18} />} label="终端" badge={terminalSessions.length || undefined} onClick={() => goToPage('terminals')} />
           <div className="nav-caption second server-shortcut-caption"><span>服务器快捷入口</span><b>{servers.length}</b></div>
           <div className="sidebar-server-list">
-            {servers.map((server) => <SidebarServerLink key={server.id} server={server} snapshot={snapshots[server.id]} active={workspace?.type !== 'localTerminal' && page === 'serverDetail' && selectedServerId === server.id} onClick={() => openServerDetail(server)} />)}
+            {orderedShortcutServers.map((server) => <SidebarServerLink key={server.id} server={server} snapshot={snapshots[server.id]} active={page === 'serverDetail' && selectedServerId === server.id} dragging={draggedShortcutServerId === server.id} dragOver={dragOverShortcutServerId === server.id} onClick={() => openServerDetail(server)} onDragStart={(event) => startShortcutDrag(event, server)} onDragEnd={() => { setDraggedShortcutServerId(null); setDragOverShortcutServerId(null) }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDragOverShortcutServerId(server.id) }} onDrop={(event) => dropShortcutServer(event, server)} />)}
             {!servers.length && <span className="sidebar-server-empty">还没有服务器</span>}
           </div>
         </nav>
         <div className="sidebar-bottom">
           <div className="local-badge"><ShieldCheck size={16} /><div><strong>本地安全模式</strong><span>凭据由 Windows 加密</span></div></div>
-          <button type="button" className={`sidebar-settings-entry ${workspace?.type !== 'localTerminal' && page === 'settings' ? 'active' : ''}`} onClick={() => goToPage('settings')}>
+          <button type="button" className={`sidebar-settings-entry ${page === 'settings' ? 'active' : ''}`} onClick={() => goToPage('settings')}>
             <Settings size={18} />
             <span><strong>偏好设置</strong><small>主题、监控与通知</small></span>
             <ChevronRight size={16} />
@@ -608,14 +778,14 @@ export function App(): React.JSX.Element {
       <main className="main-content">
         <header className="topbar">
           <div className="page-heading">
-            <h1>{workspace?.type === 'localTerminal' ? '本地终端' : page === 'serverDetail' ? (selectedServer?.name ?? '服务器详情') : page === 'dashboard' ? '运行总览' : page === 'gpus' ? 'GPU 资源' : page === 'tasks' ? '我的任务' : page === 'servers' ? '服务器管理' : page === 'terminals' ? 'SSH 终端' : page === 'alerts' ? '告警中心' : '偏好设置'}</h1>
-            <p>{workspace?.type === 'localTerminal' ? '独立 PowerShell 会话，不依赖服务器连接' : page === 'serverDetail' && selectedServer ? (() => { const route = getAccessRoute(selectedServer, accessRouteIdFor(selectedServer)); return `${route.host}:${route.port} · ${routeLabel(selectedServer, accessRouteIdFor(selectedServer))} · ${statusLabel(snapshots[selectedServer.id])}` })() : page === 'terminals' ? `${terminalSessions.length} 个 SSH 会话 · 切换页面后连接会继续运行` : page === 'tasks' ? `按 SSH 用户名汇总 · ${myTasks.length} 个运行中进程` : new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' })}</p>
+            <h1>{page === 'serverDetail' ? (selectedServer?.name ?? '服务器详情') : page === 'dashboard' ? '运行总览' : page === 'gpus' ? 'GPU 资源' : page === 'tasks' ? '我的任务' : page === 'servers' ? '服务器管理' : page === 'terminals' ? '终端' : page === 'alerts' ? '告警中心' : '偏好设置'}</h1>
+            <p>{page === 'serverDetail' && selectedServer ? (() => { const route = getAccessRoute(selectedServer, accessRouteIdFor(selectedServer)); return `${route.host}:${route.port} · ${routeLabel(selectedServer, accessRouteIdFor(selectedServer))} · ${statusLabel(snapshots[selectedServer.id])}` })() : page === 'terminals' ? `${terminalSessions.length} 个会话 · 本地与 SSH 终端在同一工作区运行` : page === 'tasks' ? `${experimentTasks.filter((task) => !task.archived).length} 个实验任务 · ${experimentTasks.filter((task) => !task.archived && task.status === 'queued').length} 个等待 GPU · ${experimentTasks.filter((task) => !task.archived && task.status === 'running').length} 个正在运行 · ${myTasks.length} 个实时 GPU 进程` : new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' })}</p>
           </div>
           <div className="topbar-actions">
-            {workspace?.type !== 'localTerminal' && (page === 'dashboard' || page === 'servers') && <div className="search-box"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索服务器、IP 或标签" /></div>}
+            {(page === 'dashboard' || page === 'servers') && <div className="search-box"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索服务器、IP 或标签" /></div>}
             <button
               type="button"
-              className={`icon-button top title-alert-button ${workspace?.type !== 'localTerminal' && page === 'alerts' ? 'active' : ''} ${alerts.length ? 'has-alerts' : ''}`}
+              className={`icon-button top title-alert-button ${page === 'alerts' ? 'active' : ''} ${alerts.length ? 'has-alerts' : ''}`}
               onClick={() => goToPage('alerts')}
               title={alerts.length ? `告警中心（${alerts.length} 条活动告警）` : '告警中心（当前无活动告警）'}
               aria-label={alerts.length ? `打开告警中心，当前有 ${alerts.length} 条活动告警` : '打开告警中心，当前无活动告警'}
@@ -623,9 +793,9 @@ export function App(): React.JSX.Element {
               <Bell size={18} />
               {alerts.length > 0 && <span aria-hidden="true">{alerts.length > 99 ? '99+' : alerts.length}</span>}
             </button>
-            {workspace?.type !== 'localTerminal' && page !== 'terminals' && page !== 'serverDetail' && <button className="icon-button top" onClick={() => void refreshSnapshots(servers, { force: true })} title="手动刷新全部服务器"><RefreshCw size={18} className={refreshing ? 'spin' : ''} /></button>}
-            {workspace?.type !== 'localTerminal' && (page === 'dashboard' || page === 'servers') && <button className="secondary-button import-button" onClick={() => void importSshConfig()} disabled={importingConfig}><FileDown size={16} />{importingConfig ? '正在读取…' : '导入 SSH Config'}{sshConfigCount > 0 && <b>{sshConfigCount}</b>}</button>}
-            {workspace?.type !== 'localTerminal' && page !== 'terminals' && <button className="primary-button" onClick={() => setDialogServer(null)}><Plus size={17} />添加服务器</button>}
+            {page !== 'terminals' && page !== 'serverDetail' && <button className="icon-button top" onClick={() => void refreshSnapshots(servers, { force: true })} title="手动刷新全部服务器"><RefreshCw size={18} className={refreshing ? 'spin' : ''} /></button>}
+            {(page === 'dashboard' || page === 'servers') && <button className="secondary-button import-button" onClick={() => void importSshConfig()} disabled={importingConfig}><FileDown size={16} />{importingConfig ? '正在读取…' : '导入 SSH Config'}</button>}
+            {page !== 'terminals' && <button className="primary-button" onClick={() => setDialogServer(null)}><Plus size={17} />添加服务器</button>}
           </div>
           <div className="window-controls" aria-label="窗口控制">
             <button onClick={() => window.labApi.windowControls.minimize()} title="最小化" aria-label="最小化"><Minus size={16} /></button>
@@ -634,13 +804,27 @@ export function App(): React.JSX.Element {
           </div>
         </header>
 
-        <div className={`page-content ${workspace?.type === 'localTerminal' ? 'local-terminal-page' : page === 'serverDetail' ? 'server-detail-page-content' : ''} ${workspace?.type !== 'localTerminal' && page === 'terminals' ? 'ssh-terminal-page' : ''}`}>
-          {workspace?.type === 'localTerminal' ? <LocalTerminalWorkspace onClose={() => setWorkspace(null)} /> : loading ? <LoadingState /> : page === 'dashboard' ? (
-            <Dashboard servers={filteredServers} snapshots={snapshots} summary={summary} alerts={alerts} testingId={testingId} vscodeConnectingId={vscodeConnectingId} accessRouteId={accessRouteIdFor} onAccessRouteChange={selectAccessRoute} onOverview={openServerDetail} onTest={testServer} onTerminal={openServerTerminal} onSftp={openSftp} onVsCode={(server) => void openVsCode(server)} onGpu={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} onEdit={(server) => setDialogServer(server)} onRemove={removeServer} onMerge={mergeServerPath} />
+        <div className={`page-content ${page === 'serverDetail' ? 'server-detail-page-content' : ''} ${page === 'terminals' ? 'ssh-terminal-page' : ''}`}>
+          {loading ? <LoadingState /> : page === 'dashboard' ? (
+            <Dashboard servers={filteredServers} snapshots={snapshots} serverOrder={settings.serverOrder} onReorder={(order) => void saveServerOrder(order)} summary={summary} alerts={alerts} testingId={testingId} vscodeConnectingId={vscodeConnectingId} accessRouteId={accessRouteIdFor} onAccessRouteChange={selectAccessRoute} onOverview={openServerDetail} onTest={testServer} onTerminal={openServerTerminal} onSftp={openSftp} onVsCode={(server) => void openVsCode(server)} onGpu={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} onEdit={(server) => setDialogServer(server)} onRemove={removeServer} onMerge={mergeServerPath} />
           ) : page === 'gpus' ? (
             <GpuOverview servers={filteredServers} snapshots={snapshots} watches={settings.gpuWatches} onToggleWatch={(target) => void toggleGpuWatch(target)} onSelect={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} />
           ) : page === 'tasks' ? (
-            <MyTasksPage tasks={myTasks} onOpenGpu={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} />
+            <ExperimentTaskPool
+              tasks={experimentTasks}
+              servers={servers}
+              snapshots={snapshots}
+              liveTasks={<MyTasksPage tasks={myTasks} onOpenGpu={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} />}
+              liveTaskCount={myTasks.length}
+              vscodeConnectingId={vscodeConnectingId}
+              onChanged={updateExperimentTask}
+              notify={notify}
+              confirm={requestConfirmation}
+              onTrusted={async () => { await loadServers() }}
+              onOpenTerminal={openExperimentTerminal}
+              onOpenFiles={openSftp}
+              onOpenVsCode={(server, routeId, path) => void openVsCode(server, routeId, path)}
+            />
           ) : page === 'servers' ? (
             <ServerTable servers={filteredServers} snapshots={snapshots} testingId={testingId} vscodeConnectingId={vscodeConnectingId} accessRouteId={accessRouteIdFor} onAccessRouteChange={selectAccessRoute} onOverview={openServerDetail} onTest={testServer} onTerminal={openServerTerminal} onSftp={openSftp} onVsCode={(server) => void openVsCode(server)} onGpu={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} onEdit={(server) => setDialogServer(server)} onRemove={removeServer} onMerge={mergeServerPath} />
           ) : page === 'serverDetail' && selectedServer ? (
@@ -653,20 +837,23 @@ export function App(): React.JSX.Element {
           <ServerTerminalWorkspace
             sessions={terminalSessions}
             activeId={activeTerminalSessionId}
-            visible={!loading && workspace?.type !== 'localTerminal' && page === 'terminals'}
+            visible={!loading && page === 'terminals'}
             servers={servers}
             accessRouteIdFor={accessRouteIdFor}
             onActivate={setActiveTerminalSessionId}
             onAdd={addTerminalSession}
+            onAddLocal={addLocalTerminalSession}
             onClose={closeTerminalSession}
             onOpenVsCode={(server, accessRouteId) => void openVsCode(server, accessRouteId)}
             vscodeConnectingId={vscodeConnectingId}
             onOpenFiles={(session) => {
               const server = servers.find((item) => item.id === session.server.id) ?? session.server
-              openSftp(server, session.accessRouteId)
+              openSftp(server, session.accessRouteId, session.currentPath)
             }}
-            onOpenServerFiles={(server) => openSftp(server)}
+            onOpenServerFiles={(server, accessRouteId) => openSftp(server, accessRouteId)}
+            onWorkingDirectory={updateTerminalWorkingDirectory}
             onTrusted={async () => { await loadServers() }}
+            confirm={requestConfirmation}
           />
         </div>
       </main>
@@ -674,6 +861,7 @@ export function App(): React.JSX.Element {
       {dialogServer !== undefined && <ServerDialog server={dialogServer} onClose={() => setDialogServer(undefined)} onSaved={(server) => void saved(server)} />}
       {gpuSelection && <GpuDetailPanel server={gpuSelection.server} snapshot={snapshots[gpuSelection.server.id]} initialGpuIndex={gpuSelection.gpuIndex} watches={settings.gpuWatches} onToggleWatch={(gpuUuid) => void toggleGpuWatch({ serverId: gpuSelection.server.id, gpuUuid })} onClose={() => setGpuSelection(null)} />}
       {closePromptOpen && <ClosePrompt remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onChoose={(action) => void resolveCloseAction(action)} />}
+      {pendingConfirmation && <ConfirmDialog {...pendingConfirmation} onCancel={() => settleConfirmation(false)} onConfirm={() => settleConfirmation(true)} />}
       <div className="toast-stack">{toasts.map((toast) => <div key={toast.id} className={`toast ${toast.kind}`}>{toast.kind === 'success' ? <CheckCircle2 size={18} /> : <XCircle size={18} />}<span>{toast.message}</span></div>)}</div>
     </div>
   )
@@ -683,10 +871,10 @@ function NavButton({ active, icon, label, badge, danger, onClick }: { active: bo
   return <button className={`nav-button ${active ? 'active' : ''}`} onClick={onClick}>{icon}<span>{label}</span>{badge !== undefined && <b className={danger ? 'danger' : ''}>{badge}</b>}</button>
 }
 
-function SidebarServerLink({ server, snapshot, active, onClick }: { server: ServerProfile; snapshot?: ServerSnapshot; active: boolean; onClick(): void }): React.JSX.Element {
+function SidebarServerLink({ server, snapshot, active, dragging, dragOver, onClick, onDragStart, onDragEnd, onDragOver, onDrop }: { server: ServerProfile; snapshot?: ServerSnapshot; active: boolean; dragging: boolean; dragOver: boolean; onClick(): void; onDragStart(event: React.DragEvent<HTMLButtonElement>): void; onDragEnd(): void; onDragOver(event: React.DragEvent<HTMLButtonElement>): void; onDrop(event: React.DragEvent<HTMLButtonElement>): void }): React.JSX.Element {
   const visualStatus = snapshot?.cached ? 'cached' : snapshot?.status ?? 'unknown'
   const busyCount = snapshot?.gpus.filter(isGpuBusy).length ?? 0
-  return <button type="button" className={`sidebar-server-link ${active ? 'active' : ''}`} onClick={onClick} title={`${server.name} · ${statusLabel(snapshot)}`}><i className={visualStatus} /><span>{server.name}</span>{snapshot?.gpus.length ? <b>{busyCount}/{snapshot.gpus.length}</b> : null}</button>
+  return <button type="button" draggable className={`sidebar-server-link ${active ? 'active' : ''}${dragging ? ' dragging' : ''}${dragOver ? ' drag-over' : ''}`} onClick={onClick} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragOver={onDragOver} onDrop={onDrop} title={`${server.name} · ${statusLabel(snapshot)} · 拖动可调整顺序`}><i className={visualStatus} /><span>{server.name}</span>{snapshot?.gpus.length ? <b>{busyCount}/{snapshot.gpus.length}</b> : null}<GripVertical className="sidebar-server-drag-icon" size={13} aria-hidden="true" /></button>
 }
 
 interface CommonServerActions {
@@ -705,7 +893,34 @@ interface CommonServerActions {
   onMerge(server: ServerProfile): void
 }
 
-function Dashboard({ servers, snapshots, summary, alerts, ...actions }: { servers: ServerProfile[]; snapshots: Record<string, ServerSnapshot>; summary: { online: number; warning: number; gpuCount: number; averageGpu: number }; alerts: Array<{ server: ServerProfile; level: 'critical' | 'warning'; title: string; detail: string }> } & CommonServerActions): React.JSX.Element {
+function Dashboard({ servers, snapshots, serverOrder, onReorder, summary, alerts, ...actions }: { servers: ServerProfile[]; snapshots: Record<string, ServerSnapshot>; serverOrder: string[]; onReorder(order: string[]): void; summary: { online: number; warning: number; gpuCount: number; averageGpu: number }; alerts: Array<{ server: ServerProfile; level: 'critical' | 'warning'; title: string; detail: string }> } & CommonServerActions): React.JSX.Element {
+  const [draggedServerId, setDraggedServerId] = useState<string | null>(null)
+  const [dragOverServerId, setDragOverServerId] = useState<string | null>(null)
+  const orderedServers = useMemo(() => {
+    const positions = new Map(serverOrder.map((serverId, index) => [serverId, index]))
+    return [...servers].sort((left, right) => (positions.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (positions.get(right.id) ?? Number.MAX_SAFE_INTEGER))
+  }, [servers, serverOrder])
+  const startCardDrag = (event: React.DragEvent<HTMLButtonElement>, server: ServerProfile): void => {
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', server.id)
+    setDraggedServerId(server.id)
+  }
+  const dropCard = (event: React.DragEvent<HTMLElement>, target: ServerProfile): void => {
+    event.preventDefault()
+    const sourceId = event.dataTransfer.getData('text/plain') || draggedServerId
+    if (sourceId && sourceId !== target.id) {
+      const next = [...orderedServers]
+      const sourceIndex = next.findIndex((server) => server.id === sourceId)
+      const targetIndex = next.findIndex((server) => server.id === target.id)
+      if (sourceIndex >= 0 && targetIndex >= 0) {
+        const [moved] = next.splice(sourceIndex, 1)
+        next.splice(targetIndex, 0, moved)
+        onReorder(next.map((server) => server.id))
+      }
+    }
+    setDraggedServerId(null)
+    setDragOverServerId(null)
+  }
   return <>
     <section className="summary-grid">
       <SummaryCard tone="teal" icon={<ServerIcon size={20} />} label="在线服务器" value={`${summary.online}/${servers.length}`} hint="本地轮询状态" />
@@ -715,16 +930,15 @@ function Dashboard({ servers, snapshots, summary, alerts, ...actions }: { server
     </section>
 
     <section className="section-block">
-      <div className="section-header"><div><h2>服务器状态</h2><p>点击终端或文件按钮开始操作真实服务器</p></div><span className="live-indicator"><i />本地实时采集</span></div>
+      <div className="section-header"><div><h2>服务器状态</h2><p>点击终端或文件按钮开始操作真实服务器 · 拖动卡片左上角可调整顺序</p></div><span className="live-indicator"><i />本地实时采集</span></div>
       <div className="server-grid">
-        {servers.map((server) => <ServerCard key={server.id} server={server} snapshot={snapshots[server.id]} {...actions} />)}
+        {orderedServers.map((server) => <ServerCard key={server.id} server={server} snapshot={snapshots[server.id]} dragging={draggedServerId === server.id} dragOver={dragOverServerId === server.id} onDragStart={(event) => startCardDrag(event, server)} onDragEnd={() => { setDraggedServerId(null); setDragOverServerId(null) }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDragOverServerId(server.id) }} onDrop={(event) => dropCard(event, server)} {...actions} />)}
         {!servers.length && <EmptyServers />}
       </div>
     </section>
 
     <section className="dashboard-lower">
       <div className="panel recent-alerts"><div className="panel-title"><div><h3>活动告警</h3><p>磁盘、温度与连接状态</p></div><Bell size={19} /></div>{alerts.length ? alerts.slice(0, 4).map((alert, index) => <div className="alert-row" key={`${alert.server.id}-${index}`}><div className={`alert-icon ${alert.level}`}><AlertTriangle size={16} /></div><div><strong>{alert.title}</strong><span>{alert.server.name} · {alert.detail}</span></div><time>刚刚</time></div>) : <div className="healthy-state"><CheckCircle2 size={30} /><strong>一切正常</strong><span>当前没有需要处理的告警</span></div>}</div>
-      <div className="panel quick-guide"><div className="panel-title"><div><h3>Demo 使用指引</h3><p>三步连接第一台真实服务器</p></div><ShieldCheck size={19} /></div><ol><li><b>1</b><div><strong>添加连接</strong><span>填写服务器地址和个人 SSH 凭据</span></div></li><li><b>2</b><div><strong>核对主机指纹</strong><span>首次连接时通过可信渠道确认</span></div></li><li><b>3</b><div><strong>终端与监控</strong><span>应用自动采集只读指标并打开 Shell</span></div></li></ol></div>
     </section>
   </>
 }
@@ -733,7 +947,7 @@ function SummaryCard({ tone, icon, label, value, hint }: { tone: string; icon: R
   return <div className="summary-card"><div className={`summary-icon ${tone}`}>{icon}</div><div><span>{label}</span><strong>{value}</strong><small>{hint}</small></div></div>
 }
 
-function ServerCard({ server, snapshot, testingId, vscodeConnectingId, accessRouteId, onAccessRouteChange, onOverview, onTest, onTerminal, onSftp, onVsCode, onGpu, onEdit, onRemove, onMerge }: { server: ServerProfile; snapshot?: ServerSnapshot } & CommonServerActions): React.JSX.Element {
+function ServerCard({ server, snapshot, dragging, dragOver, onDragStart, onDragEnd, onDragOver, onDrop, testingId, vscodeConnectingId, accessRouteId, onAccessRouteChange, onOverview, onTest, onTerminal, onSftp, onVsCode, onGpu, onEdit, onRemove, onMerge }: { server: ServerProfile; snapshot?: ServerSnapshot; dragging: boolean; dragOver: boolean; onDragStart(event: React.DragEvent<HTMLButtonElement>): void; onDragEnd(): void; onDragOver(event: React.DragEvent<HTMLElement>): void; onDrop(event: React.DragEvent<HTMLElement>): void } & CommonServerActions): React.JSX.Element {
   const memoryPercent = snapshot?.memoryTotalBytes && snapshot.memoryUsedBytes ? snapshot.memoryUsedBytes / snapshot.memoryTotalBytes * 100 : null
   const disk = snapshot?.fileSystems.find((item) => item.mountPoint === '/') ?? snapshot?.fileSystems[0]
   const gpus = snapshot?.gpus ?? []
@@ -747,8 +961,8 @@ function ServerCard({ server, snapshot, testingId, vscodeConnectingId, accessRou
   const visualStatus = snapshot?.cached ? 'cached' : snapshot?.status ?? 'unknown'
   const selectedRouteId = accessRouteId(server)
   const selectedRoute = getAccessRoute(server, selectedRouteId)
-  return <article className={`server-card status-${visualStatus}`}>
-    <div className="server-card-head"><button type="button" className="server-title server-title-button" onClick={() => onOverview(server)} title="打开服务器总览"><div className="server-symbol"><ServerIcon size={20} /></div><div><div className="name-row"><h3>{server.name}</h3>{server.mode === 'demo' && <span className="demo-chip">演示</span>}</div><p>{selectedRoute.username}@{selectedRoute.host}:{selectedRoute.port}</p></div></button><div className={`status-dot ${visualStatus}`} title={statusLabel(snapshot)} /></div>
+  return <article className={`server-card status-${visualStatus}${dragging ? ' dragging' : ''}${dragOver ? ' drag-over' : ''}`} onDragOver={onDragOver} onDrop={onDrop}>
+    <div className="server-card-head"><div className="server-card-heading"><button type="button" className="server-card-drag-handle" draggable title="拖动调整顺序" aria-label={`拖动调整 ${server.name} 的顺序`} onDragStart={onDragStart} onDragEnd={onDragEnd}><GripVertical size={17} /></button><button type="button" className="server-title server-title-button" onClick={() => onOverview(server)} title="打开服务器总览"><div className="server-symbol"><ServerIcon size={20} /></div><div><div className="name-row"><h3>{server.name}</h3>{server.mode === 'demo' && <span className="demo-chip">演示</span>}</div><p>{selectedRoute.username}@{selectedRoute.host}:{selectedRoute.port}</p></div></button></div><div className={`status-dot ${visualStatus}`} title={statusLabel(snapshot)} /></div>
     <div className="server-meta"><span className="monitor-policy-chip">采集：{monitorPolicyLabel[server.monitorPolicy]}</span><span>{server.group}</span>{server.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
     {offline ? <div className="offline-message"><WifiOff size={18} /><div><strong>暂时无法连接</strong><span>{snapshot.error}</span></div></div> : <div className="metric-list">
       <MetricRow icon={<Cpu size={15} />} label="CPU" value={formatPercent(snapshot?.cpuUsagePercent)} percent={snapshot?.cpuUsagePercent ?? 0} />
@@ -756,7 +970,7 @@ function ServerCard({ server, snapshot, testingId, vscodeConnectingId, accessRou
       <MetricRow icon={<HardDrive size={15} />} label="系统盘" value={formatPercent(disk?.usagePercent)} percent={disk?.usagePercent ?? 0} warn={(disk?.usagePercent ?? 0) >= 80} />
       {primaryGpu && <button className="gpu-metric-button" onClick={() => onGpu(server, primaryGpu.index)} title="查看每块 GPU 和当前进程"><MetricRow icon={<Activity size={15} />} label="GPU" value={`${busyGpuCount}/${gpus.length}`} percent={gpus.length ? busyGpuCount / gpus.length * 100 : 0} warn={peakGpuTemperature >= 80} /></button>}
     </div>}
-    <div className="server-card-foot"><AccessRouteSelect server={server} value={selectedRouteId} onChange={(routeId) => onAccessRouteChange(server, routeId)} /><div className="card-actions">{isLegacyJumpProfile(server.name) && <button onClick={() => onMerge(server)} title="将此条目合并为主服务器的连接路径"><GitMerge size={15} /></button>}<button onClick={() => onTest(server)} disabled={testingId === server.id} title="测试连接"><RefreshCw size={15} className={testingId === server.id ? 'spin' : ''} /></button><button onClick={() => onSftp(server)} title="独立文件传输窗口"><FolderOpen size={15} /></button><button className="server-vscode-action" onClick={() => onVsCode(server)} disabled={vscodeConnectingId === server.id} title={vscodeConnectingId === server.id ? 'VS Code 连接中' : '独立 VS Code Remote-SSH 窗口'} aria-label={vscodeConnectingId === server.id ? 'VS Code 连接中' : '打开 VS Code'}><Code2 size={15} /></button><button className="terminal-action" onClick={() => onTerminal(server)} title="打开终端" aria-label="打开终端"><SquareTerminal size={15} /></button><button onClick={() => onEdit(server)} title="编辑"><Pencil size={14} /></button><button onClick={() => onRemove(server)} title="删除"><Trash2 size={14} /></button></div></div>
+    <div className="server-card-foot"><AccessRouteSelect server={server} value={selectedRouteId} onChange={(routeId) => onAccessRouteChange(server, routeId)} /><div className="card-actions">{isLegacyJumpProfile(server.name) && <button onClick={() => onMerge(server)} title="将此条目的 SSH 路径合并到主服务器"><GitMerge size={15} /></button>}<button onClick={() => onTest(server)} disabled={testingId === server.id} title="测试连接"><RefreshCw size={15} className={testingId === server.id ? 'spin' : ''} /></button><button onClick={() => onSftp(server)} title="独立文件传输窗口"><FolderOpen size={15} /></button><button className="server-vscode-action" onClick={() => onVsCode(server)} disabled={vscodeConnectingId === server.id} title={vscodeConnectingId === server.id ? 'VS Code 连接中' : '独立 VS Code Remote-SSH 窗口'} aria-label={vscodeConnectingId === server.id ? 'VS Code 连接中' : '打开 VS Code'}><Code2 size={15} /></button><button className="terminal-action" onClick={() => onTerminal(server)} title="打开终端" aria-label="打开终端"><SquareTerminal size={15} /></button><button onClick={() => onEdit(server)} title="编辑"><Pencil size={14} /></button><button onClick={() => onRemove(server)} title="删除"><Trash2 size={14} /></button></div></div>
   </article>
 }
 
@@ -773,7 +987,7 @@ function ServerTable({ servers, snapshots, ...actions }: { servers: ServerProfil
     const busyGpus = snapshot?.gpus.filter(isGpuBusy) ?? []
     const firstGpuIndex = busyGpus[0]?.index ?? snapshot?.gpus[0]?.index
     const selectedRoute = getAccessRoute(server, actions.accessRouteId(server))
-    return <div className="server-table-row" key={server.id}><button type="button" className="table-server table-server-button" onClick={() => actions.onOverview(server)}><div className="server-symbol small"><ServerIcon size={17} /></div><div><strong>{server.name}</strong><span>{selectedRoute.host}:{selectedRoute.port} · {selectedRoute.username}</span></div></button><div><span className={`table-status ${visualStatus}`}><i />{statusLabel(snapshot)}</span><small className="table-policy">{monitorPolicyLabel[server.monitorPolicy]}采集</small></div><div className="resource-summary"><span><Cpu size={14} />{formatPercent(snapshot?.cpuUsagePercent)}</span><span><MemoryStick size={14} />{snapshot?.memoryUsedBytes ? formatBytes(snapshot.memoryUsedBytes) : '—'}</span><span><HardDrive size={14} />{formatPercent(disk?.usagePercent)}</span>{snapshot?.gpus.length && firstGpuIndex !== undefined ? <button onClick={() => actions.onGpu(server, firstGpuIndex)}><Activity size={14} />{busyGpus.length}/{snapshot.gpus.length} 忙碌</button> : null}</div><div className="table-tags"><b>{server.group}</b>{server.tags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}</div><div className="table-actions"><AccessRouteSelect server={server} value={actions.accessRouteId(server)} compact onChange={(routeId) => actions.onAccessRouteChange(server, routeId)} />{isLegacyJumpProfile(server.name) && <button className="icon-button small" onClick={() => actions.onMerge(server)} title="将此条目合并为主服务器的连接路径"><GitMerge size={15} /></button>}<button className="icon-button small" onClick={() => actions.onTest(server)}><RefreshCw size={15} className={actions.testingId === server.id ? 'spin' : ''} /></button><button className="icon-button small" onClick={() => actions.onSftp(server)} title="独立文件传输窗口"><FolderOpen size={15} /></button><button className="icon-button small server-vscode-icon" onClick={() => actions.onVsCode(server)} disabled={actions.vscodeConnectingId === server.id} title="独立 VS Code Remote-SSH 窗口"><Code2 size={15} /></button><button className="table-terminal" onClick={() => actions.onTerminal(server)}><SquareTerminal size={15} />终端</button><button className="icon-button small" onClick={() => actions.onEdit(server)}><Pencil size={14} /></button><button className="icon-button small danger-hover" onClick={() => actions.onRemove(server)}><Trash2 size={14} /></button></div></div>
+    return <div className="server-table-row" key={server.id}><button type="button" className="table-server table-server-button" onClick={() => actions.onOverview(server)}><div className="server-symbol small"><ServerIcon size={17} /></div><div><strong>{server.name}</strong><span>{selectedRoute.host}:{selectedRoute.port} · {selectedRoute.username}</span></div></button><div><span className={`table-status ${visualStatus}`}><i />{statusLabel(snapshot)}</span><small className="table-policy">{monitorPolicyLabel[server.monitorPolicy]}采集</small></div><div className="resource-summary"><span><Cpu size={14} />{formatPercent(snapshot?.cpuUsagePercent)}</span><span><MemoryStick size={14} />{snapshot?.memoryUsedBytes ? formatBytes(snapshot.memoryUsedBytes) : '—'}</span><span><HardDrive size={14} />{formatPercent(disk?.usagePercent)}</span>{snapshot?.gpus.length && firstGpuIndex !== undefined ? <button onClick={() => actions.onGpu(server, firstGpuIndex)}><Activity size={14} />{busyGpus.length}/{snapshot.gpus.length} 忙碌</button> : null}</div><div className="table-tags"><b>{server.group}</b>{server.tags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}</div><div className="table-actions"><AccessRouteSelect server={server} value={actions.accessRouteId(server)} compact onChange={(routeId) => actions.onAccessRouteChange(server, routeId)} />{isLegacyJumpProfile(server.name) && <button className="icon-button small" onClick={() => actions.onMerge(server)} title="将此条目的 SSH 路径合并到主服务器"><GitMerge size={15} /></button>}<button className="icon-button small" onClick={() => actions.onTest(server)}><RefreshCw size={15} className={actions.testingId === server.id ? 'spin' : ''} /></button><button className="icon-button small" onClick={() => actions.onSftp(server)} title="独立文件传输窗口"><FolderOpen size={15} /></button><button className="icon-button small server-vscode-icon" onClick={() => actions.onVsCode(server)} disabled={actions.vscodeConnectingId === server.id} title="独立 VS Code Remote-SSH 窗口"><Code2 size={15} /></button><button className="table-terminal" onClick={() => actions.onTerminal(server)}><SquareTerminal size={15} />终端</button><button className="icon-button small" onClick={() => actions.onEdit(server)}><Pencil size={14} /></button><button className="icon-button small danger-hover" onClick={() => actions.onRemove(server)}><Trash2 size={14} /></button></div></div>
   })}</div></section>
 }
 
@@ -899,14 +1113,19 @@ function ClosePrompt({ remember, onRememberChange, onChoose }: { remember: boole
 
   return <div className="close-choice-overlay app-modal-overlay" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onChoose('cancel') }}>
     <section className="close-choice-dialog app-modal" role="dialog" aria-modal="true" aria-labelledby="close-choice-title">
-      <div className="close-choice-rail"><div className="close-choice-mark"><LabDeckMark /></div><span>后台服务</span></div>
+      <header className="dialog-header app-modal-header close-choice-header">
+        <div className="dialog-title-wrap app-modal-title">
+          <div className="dialog-icon close-choice-icon"><Power size={19} /></div>
+          <div><h2 id="close-choice-title">关闭 LabDeck？</h2><p>你可以让监控继续运行，或者完全退出应用。</p></div>
+        </div>
+        <button type="button" className="icon-button" onClick={() => onChoose('cancel')} aria-label="取消关闭"><X size={18} /></button>
+      </header>
       <div className="close-choice-content">
-        <header><div><h2 id="close-choice-title">关闭 LabDeck？</h2><p>你可以让监控继续运行，或者完全退出应用。</p></div><button type="button" className="close-choice-dismiss" onClick={() => onChoose('cancel')} title="取消关闭"><X size={17} /></button></header>
         <div className="close-choice-actions">
           <button type="button" className="close-choice-action tray" autoFocus onClick={() => onChoose('tray')}><span className="close-choice-action-icon"><Bell size={18} /></span><span><strong>留在系统托盘</strong><small>隐藏主窗口，SSH 会话和监控继续运行</small></span><ChevronRight size={17} /></button>
           <button type="button" className="close-choice-action exit" onClick={() => onChoose('exit')}><span className="close-choice-action-icon"><Power size={18} /></span><span><strong>退出应用</strong><small>关闭 SSH，前台命令可能中断；停止后台监控</small></span><ChevronRight size={17} /></button>
         </div>
-        <footer><button type="button" className={`close-choice-remember ${remember ? 'checked' : ''}`} role="checkbox" aria-checked={remember} onClick={() => onRememberChange(!remember)}><i>{remember && <Check size={12} />}</i><span>记住我的选择</span></button><button type="button" className="close-choice-cancel" onClick={() => onChoose('cancel')}>取消</button></footer>
+        <footer className="close-choice-footer app-modal-footer"><button type="button" className={`close-choice-remember ${remember ? 'checked' : ''}`} role="checkbox" aria-checked={remember} onClick={() => onRememberChange(!remember)}><i>{remember && <Check size={12} />}</i><span>记住我的选择</span></button><button type="button" className="secondary-button" onClick={() => onChoose('cancel')}>取消</button></footer>
       </div>
     </section>
   </div>
@@ -922,7 +1141,7 @@ function SettingsPage({ settings, onChange, onSave }: { settings: AppSettings; o
         <ThemeOption name="深色机房" description="高对比，适合暗光值守" value="machineRoom" selected={settings.theme === 'machineRoom'} onSelect={() => onChange({ ...settings, theme: 'machineRoom' })} />
       </div>
     </section>
-    <div className="settings-layout"><section className="panel settings-panel"><div className="panel-title"><div><h3>监控设置</h3><p>控制持续监控服务器的轮询频率与并发连接</p></div><Gauge size={19} /></div><SettingToggle label="启用后台监控" description="仅定时采集标记为“持续监控”的服务器" checked={settings.monitoringEnabled} onChange={(value) => onChange({ ...settings, monitoringEnabled: value })} /><SettingToggle label="告警系统通知" description="发现离线、磁盘或温度异常时通知" checked={settings.notifyOnWarning} onChange={(value) => onChange({ ...settings, notifyOnWarning: value })} /><label className="settings-field"><div><strong>关闭窗口时</strong><span>退出会关闭 SSH，前台命令可能中断</span></div><select value={settings.closeBehavior} onChange={(event) => onChange({ ...settings, closeBehavior: event.target.value as AppSettings['closeBehavior'] })}><option value="ask">每次询问</option><option value="tray">总是留在系统托盘</option><option value="exit">直接退出应用</option></select></label><label className="settings-field"><div><strong>轮询间隔</strong><span>建议不少于 30 秒，避免频繁建立 SSH 连接</span></div><select value={settings.pollingIntervalSeconds} onChange={(event) => onChange({ ...settings, pollingIntervalSeconds: Number(event.target.value) })}><option value={30}>30 秒</option><option value={60}>60 秒</option><option value={120}>2 分钟</option><option value={300}>5 分钟</option></select></label><label className="settings-field"><div><strong>最大并发采集</strong><span>服务器较多时限制同时建立的 SSH 连接数</span></div><select value={settings.maxConcurrentPolls} onChange={(event) => onChange({ ...settings, maxConcurrentPolls: Number(event.target.value) })}><option value={3}>3 个</option><option value={5}>5 个</option><option value={10}>10 个</option></select></label><div className="settings-footer"><button className="primary-button" onClick={onSave}>保存设置</button></div></section><section className="panel security-panel"><div className="panel-title"><div><h3>安全状态</h3><p>当前应用的安全保护</p></div><ShieldCheck size={19} /></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>进程隔离已启用</strong><span>Renderer 无法直接访问 Node.js</span></div></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>凭据加密存储</strong><span>由当前 Windows 用户的 DPAPI 保护</span></div></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>主机指纹校验</strong><span>首次连接确认，变化时拒绝连接</span></div></div><div className="settings-warning"><AlertTriangle size={17} /><p>退出托盘程序或电脑进入睡眠后，本地监控和告警会停止。</p></div></section></div>
+    <div className="settings-layout"><section className="panel settings-panel"><div className="panel-title"><div><h3>监控设置</h3><p>控制持续监控服务器的轮询频率与并发连接</p></div><Gauge size={19} /></div><SettingToggle label="启用后台监控" description="仅定时采集标记为“持续监控”的服务器" checked={settings.monitoringEnabled} onChange={(value) => onChange({ ...settings, monitoringEnabled: value })} /><SettingToggle label="告警系统通知" description="发现离线、磁盘或温度异常时通知" checked={settings.notifyOnWarning} onChange={(value) => onChange({ ...settings, notifyOnWarning: value })} /><label className="settings-field"><div><strong>关闭窗口时</strong><span>退出会关闭 SSH，前台命令可能中断</span></div><select value={settings.closeBehavior} onChange={(event) => onChange({ ...settings, closeBehavior: event.target.value as AppSettings['closeBehavior'] })}><option value="ask">每次询问</option><option value="tray">总是留在系统托盘</option><option value="exit">直接退出应用</option></select></label><label className="settings-field"><div><strong>轮询间隔</strong><span>较短间隔更新更及时；若上一轮未完成，不会重叠启动采集</span></div><select value={settings.pollingIntervalSeconds} onChange={(event) => onChange({ ...settings, pollingIntervalSeconds: Number(event.target.value) })}><option value={10}>10 秒</option><option value={15}>15 秒</option><option value={30}>30 秒</option><option value={60}>60 秒</option><option value={120}>2 分钟</option><option value={300}>5 分钟</option></select></label><label className="settings-field"><div><strong>最大并发采集</strong><span>服务器较多时限制同时建立的 SSH 连接数</span></div><select value={settings.maxConcurrentPolls} onChange={(event) => onChange({ ...settings, maxConcurrentPolls: Number(event.target.value) })}><option value={3}>3 个</option><option value={5}>5 个</option><option value={10}>10 个</option></select></label><div className="settings-footer"><button className="primary-button" onClick={onSave}>保存设置</button></div></section><section className="panel security-panel"><div className="panel-title"><div><h3>安全状态</h3><p>当前应用的安全保护</p></div><ShieldCheck size={19} /></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>进程隔离已启用</strong><span>Renderer 无法直接访问 Node.js</span></div></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>凭据加密存储</strong><span>由当前 Windows 用户的 DPAPI 保护</span></div></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>主机指纹校验</strong><span>首次连接确认，变化时拒绝连接</span></div></div><div className="settings-warning"><AlertTriangle size={17} /><p>退出托盘程序或电脑进入睡眠后，本地监控和告警会停止。</p></div></section></div>
   </div>
 }
 

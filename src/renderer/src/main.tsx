@@ -6,4 +6,5 @@ import { SftpWindowApp } from './components/SftpPanel'
 
 const sftpServerId = new URLSearchParams(window.location.search).get('sftpServerId')
 const sftpRouteId = new URLSearchParams(window.location.search).get('sftpRouteId') ?? undefined
-ReactDOM.createRoot(document.getElementById('root')!).render(sftpServerId ? <SftpWindowApp serverId={sftpServerId} accessRouteId={sftpRouteId} /> : <App />)
+const sftpInitialPath = new URLSearchParams(window.location.search).get('sftpInitialPath') ?? undefined
+ReactDOM.createRoot(document.getElementById('root')!).render(sftpServerId ? <SftpWindowApp serverId={sftpServerId} accessRouteId={sftpRouteId} initialPath={sftpInitialPath} /> : <App />)

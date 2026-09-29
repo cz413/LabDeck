@@ -1,6 +1,6 @@
 {
   "name": "lab-server-manager",
-  "version": "0.6.13",
+  "version": "0.6.25",
   "description": "本地优先的实验室服务器管理桌面应用",
   "main": "out/main/index.js",
   "author": "Lab Server Manager",
@@ -64,7 +64,8 @@
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
-      "createDesktopShortcut": true
+      "createDesktopShortcut": true,
+      "include": "build/installer.nsh"
     }
   }
 }

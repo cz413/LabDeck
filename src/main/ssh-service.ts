@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises'
 import { performance } from 'node:perf_hooks'
 import type { Duplex } from 'node:stream'
-import { Client, type ConnectConfig } from 'ssh2'
+import { Client, type ClientChannel, type ConnectConfig } from 'ssh2'
 import type {
   ConnectionTestResult,
   JumpHostConfig,
@@ -119,31 +119,46 @@ export class SshService {
   exec(client: Client, command: string, timeoutMs = 10000): Promise<string> {
     return new Promise((resolve, reject) => {
       let completed = false
+      let stream: ClientChannel | undefined
       const timer = setTimeout(() => {
         if (completed) return
         completed = true
+        stream?.close()
         reject(new Error('远程命令执行超时'))
       }, timeoutMs)
-      client.exec(command, (error, stream) => {
+      client.exec(command, (error, openedStream) => {
+        if (completed) {
+          openedStream?.close()
+          return
+        }
         if (error) {
           clearTimeout(timer)
           completed = true
           reject(error)
           return
         }
+        if (!openedStream) {
+          clearTimeout(timer)
+          completed = true
+          reject(new Error('SSH 未返回远程命令通道'))
+          return
+        }
+        const activeStream = openedStream
+        stream = activeStream
         const chunks: Buffer[] = []
         const errorChunks: Buffer[] = []
         const fail = (streamError: Error): void => {
           if (completed) return
           completed = true
           clearTimeout(timer)
+          activeStream.close()
           reject(streamError)
         }
-        stream.on('data', (chunk: Buffer) => chunks.push(chunk))
-        stream.on('error', fail)
-        stream.stderr.on('data', (chunk: Buffer) => errorChunks.push(chunk))
-        stream.stderr.on('error', fail)
-        stream.on('close', (code: number | null) => {
+        activeStream.on('data', (chunk: Buffer) => chunks.push(chunk))
+        activeStream.on('error', fail)
+        activeStream.stderr.on('data', (chunk: Buffer) => errorChunks.push(chunk))
+        activeStream.stderr.on('error', fail)
+        activeStream.on('close', (code: number | null) => {
           if (completed) return
           completed = true
           clearTimeout(timer)

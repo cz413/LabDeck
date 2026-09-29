@@ -64,10 +64,10 @@ export function GpuDetailPanel({ server, snapshot, initialGpuIndex, watches, onT
     return () => { active = false }
   }, [server.id, selected?.uuid, historyRange, snapshot?.sampledAt])
 
-  return <div className="workspace-overlay gpu-overlay app-modal-overlay">
-    <div className="gpu-workspace app-modal">
-      <header className="workspace-header gpu-header">
-        <div><div className="workspace-kicker">GPU 资源详情</div><h2>{server.name}</h2><p>{server.username}@{server.host} · {snapshot?.cached ? '上次采集于' : '采集于'} {snapshot ? new Date(snapshot.sampledAt).toLocaleTimeString('zh-CN') : '—'}</p></div>
+  return <div className="workspace-overlay gpu-overlay app-modal-overlay" role="presentation">
+    <div className="gpu-workspace app-modal" role="dialog" aria-modal="true" aria-labelledby="gpu-dialog-title">
+      <header className="workspace-header gpu-header app-modal-header">
+        <div><div className="workspace-kicker">GPU 资源详情</div><h2 id="gpu-dialog-title">{server.name}</h2><p>{server.username}@{server.host} · {snapshot?.cached ? '上次采集于' : '采集于'} {snapshot ? new Date(snapshot.sampledAt).toLocaleTimeString('zh-CN') : '—'}</p></div>
         <button className="icon-button" onClick={onClose} aria-label="关闭 GPU 详情"><X size={19} /></button>
       </header>
 

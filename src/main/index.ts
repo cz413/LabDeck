@@ -1,9 +1,10 @@
 import { app, BrowserWindow, clipboard, dialog, ipcMain, Menu, Notification, shell, Tray } from 'electron'
 import { writeFile } from 'node:fs/promises'
-import { basename, join } from 'node:path'
-import type { AppSettings, GpuHistoryRange, GpuMetric, ServerProfile, ServerProfileInput, ServerSnapshot, SftpTransferProgress } from '../shared/types'
+import { basename, join, posix } from 'node:path'
+import type { AppSettings, CondaEnvironmentConfig, CondaManager, ExperimentRunFinishInput, ExperimentRunStartInput, ExperimentTaskDraft, ExperimentTaskStatus, GpuHistoryRange, GpuMetric, RemoteCondaResult, ServerProfile, ServerProfileInput, ServerSnapshot, SftpTransferProgress } from '../shared/types'
 import { isGpuBusy } from '../shared/gpu-status'
 import { applyAccessRoute, getDefaultAccessRouteId } from '../shared/access-routes'
+import { condaEnvironmentConfigSchema, experimentRunStartInputSchema } from '../shared/schemas'
 import { AppStore } from './store'
 import { MonitorService } from './monitor-service'
 import { SftpService } from './sftp-service'
@@ -11,10 +12,14 @@ import { SshService } from './ssh-service'
 import { SshConfigService } from './ssh-config-service'
 import { TerminalManager } from './terminal-manager'
 import { VsCodeService } from './vscode-service'
+import { CondaService } from './conda-service'
+import { ExperimentScheduler } from './experiment-scheduler'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let terminalManager: TerminalManager | null = null
+let monitorService: MonitorService | null = null
+let experimentScheduler: ExperimentScheduler | null = null
 const sftpWindows = new Map<string, BrowserWindow>()
 let quittingAfterTerminalCleanup = false
 let trayHintShown = false
@@ -226,18 +231,52 @@ function resolveConnectionProfile(store: AppStore, serverId: string, accessRoute
   return applyAccessRoute(store.getServer(serverId), accessRouteId)
 }
 
-function createSftpWindow(store: AppStore, serverId: string, accessRouteId?: string): BrowserWindow {
+async function withRemoteConda<T>(
+  store: AppStore,
+  ssh: SshService,
+  serverId: string,
+  accessRouteId: string,
+  operation: (profile: ServerProfile, secrets: ReturnType<AppStore['getSecrets']>) => Promise<T>
+): Promise<RemoteCondaResult<T>> {
+  const profile = resolveConnectionProfile(store, serverId, accessRouteId)
+  if (profile.mode !== 'real') throw new Error('演示节点不支持 Conda 远程操作')
+  const secrets = store.getSecrets(serverId)
+  if (!profile.hostFingerprint || (profile.jumpHost && !profile.jumpHost.hostFingerprint)) {
+    const required = await ssh.scanRequiredHostKey(profile, secrets)
+    return {
+      status: 'host-key-required',
+      fingerprint: required.fingerprint,
+      hostKeyTarget: required.target,
+      message: required.target === 'jumpHost'
+        ? '首次连接，请核对并信任跳板机主机指纹'
+        : '首次连接，请核对并信任目标服务器主机指纹'
+    }
+  }
+  return { status: 'success', value: await operation(profile, secrets) }
+}
+
+function createSftpWindow(store: AppStore, serverId: string, accessRouteId?: string, requestedPath?: string): BrowserWindow {
   const routeId = accessRouteId ?? getDefaultAccessRouteId(store.getServer(serverId))
+  const profile = resolveConnectionProfile(store, serverId, routeId)
+  const homePath = `/home/${profile.username.trim() || 'user'}`
+  const initialPath = requestedPath?.startsWith('/') && !requestedPath.includes('\0')
+    ? posix.normalize(requestedPath)
+    : homePath
   const windowKey = `${serverId}:${routeId}`
   const existing = sftpWindows.get(windowKey)
   if (existing && !existing.isDestroyed()) {
+    const navigate = (): void => {
+      if (!existing.isDestroyed() && !existing.webContents.isDestroyed()) existing.webContents.send('sftp:navigate', initialPath)
+    }
+    if (existing.webContents.isLoading()) existing.webContents.once('did-finish-load', navigate)
+    else navigate()
     if (existing.isMinimized()) existing.restore()
     existing.show()
     existing.focus()
     return existing
   }
 
-  const server = store.getServer(serverId)
+  const server = profile
   const window = new BrowserWindow({
     width: 1120,
     height: 760,
@@ -271,7 +310,7 @@ function createSftpWindow(store: AppStore, serverId: string, accessRouteId?: str
   })
   window.webContents.on('will-navigate', (event) => event.preventDefault())
   window.setMenuBarVisibility(false)
-  const query = `?sftpServerId=${encodeURIComponent(serverId)}&sftpRouteId=${encodeURIComponent(routeId)}`
+  const query = `?sftpServerId=${encodeURIComponent(serverId)}&sftpRouteId=${encodeURIComponent(routeId)}&sftpInitialPath=${encodeURIComponent(initialPath)}`
   if (process.env.ELECTRON_RENDERER_URL) void window.loadURL(`${process.env.ELECTRON_RENDERER_URL}${query}`)
   else void window.loadFile(join(__dirname, '../renderer/index.html'), { search: query })
   return window
@@ -361,9 +400,16 @@ function registerIpc(store: AppStore): void {
   const ssh = new SshService()
   const sshConfig = new SshConfigService(store)
   const monitor = new MonitorService(ssh)
+  monitorService = monitor
+  monitor.setPollingInterval(store.getSettings().pollingIntervalSeconds)
   const sftp = new SftpService(ssh)
   const vscode = new VsCodeService(store)
+  const conda = new CondaService(ssh)
   terminalManager = new TerminalManager(ssh, () => mainWindow?.webContents ?? null)
+  experimentScheduler = new ExperimentScheduler(store, ssh, monitor, conda, () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('experiments:changed')
+  })
+  void experimentScheduler.start().catch((error) => console.error('实验任务调度器启动失败：', error))
 
   ipcMain.on('window:minimize', (event) => {
     const targetWindow = BrowserWindow.fromWebContents(event.sender)
@@ -393,16 +439,30 @@ function registerIpc(store: AppStore): void {
   ipcMain.handle('clipboard:writeText', (_event, text: string) => clipboard.writeText(text))
 
   ipcMain.handle('servers:list', () => store.listServers())
-  ipcMain.handle('servers:save', (_event, input: ServerProfileInput) => store.saveServer(input))
-  ipcMain.handle('servers:mergeAccessRoute', (_event, serverId: string, sourceServerId: string) => store.mergeAccessRoute(serverId, sourceServerId))
-  ipcMain.handle('servers:remove', (_event, id: string) => store.removeServer(id))
+  ipcMain.handle('servers:save', async (_event, input: ServerProfileInput) => {
+    const saved = await store.saveServer(input)
+    monitor.invalidateServer(saved.id)
+    return saved
+  })
+  ipcMain.handle('servers:mergeAccessRoute', async (_event, serverId: string, sourceServerId: string) => {
+    const merged = await sshConfig.mergeAccessRoute(serverId, sourceServerId)
+    monitor.invalidateServer(serverId)
+    monitor.invalidateServer(sourceServerId)
+    return merged
+  })
+  ipcMain.handle('servers:remove', async (_event, id: string) => {
+    await store.removeServer(id)
+    monitor.invalidateServer(id)
+  })
   ipcMain.handle('servers:test', async (_event, id: string, accessRouteId?: string) => {
     const profile = resolveConnectionProfile(store, id, accessRouteId)
     return ssh.testConnection(profile, store.getSecrets(id))
   })
-  ipcMain.handle('servers:trustHost', (_event, id: string, fingerprint: string, target?: 'server' | 'jumpHost', accessRouteId?: string) =>
-    store.trustHost(id, fingerprint, target, accessRouteId)
-  )
+  ipcMain.handle('servers:trustHost', async (_event, id: string, fingerprint: string, target?: 'server' | 'jumpHost', accessRouteId?: string) => {
+    const trusted = await store.trustHost(id, fingerprint, target, accessRouteId)
+    monitor.invalidateServer(id)
+    return trusted
+  })
   ipcMain.handle('servers:choosePrivateKey', async () => {
     const result = await dialog.showOpenDialog(mainWindow!, {
       title: '选择 SSH 私钥',
@@ -411,8 +471,11 @@ function registerIpc(store: AppStore): void {
     })
     return result.canceled ? null : result.filePaths[0]
   })
-  ipcMain.handle('sshConfig:scan', () => sshConfig.scan())
-  ipcMain.handle('sshConfig:importAll', () => sshConfig.importAll())
+  ipcMain.handle('sshConfig:importAll', async () => {
+    const result = await sshConfig.importAll()
+    for (const profile of result.imported) monitor.invalidateServer(profile.id)
+    return result
+  })
 
   ipcMain.handle('monitor:snapshot', async (_event, id: string, accessRouteId?: string) => {
     const profile = resolveConnectionProfile(store, id, accessRouteId)
@@ -450,8 +513,8 @@ function registerIpc(store: AppStore): void {
     const profile = resolveConnectionProfile(store, id, accessRouteId)
     return sftp.list(profile, store.getSecrets(id), remotePath)
   })
-  ipcMain.handle('sftp:openWindow', (_event, id: string, accessRouteId?: string) => {
-    createSftpWindow(store, id, accessRouteId)
+  ipcMain.handle('sftp:openWindow', (_event, id: string, accessRouteId?: string, initialPath?: string) => {
+    createSftpWindow(store, id, accessRouteId, initialPath)
   })
   ipcMain.handle('sftp:chooseUploadFile', async (event) => {
     const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender) ?? mainWindow!, {
@@ -516,14 +579,41 @@ function registerIpc(store: AppStore): void {
     return result.filePath
   })
 
-  ipcMain.handle('vscode:openRemote', (_event, id: string, accessRouteId?: string) => {
-    return vscode.openRemote(resolveConnectionProfile(store, id, accessRouteId), accessRouteId)
+  ipcMain.handle('vscode:openRemote', (_event, id: string, accessRouteId?: string, remotePath?: string) => {
+    return vscode.openRemote(resolveConnectionProfile(store, id, accessRouteId), accessRouteId, remotePath)
+  })
+
+  ipcMain.handle('experiments:list', () => store.listExperimentTasks())
+  ipcMain.handle('experiments:save', (_event, input: ExperimentTaskDraft) => store.saveExperimentTask(input))
+  ipcMain.handle('experiments:setStatus', (_event, taskId: string, status: ExperimentTaskStatus) => store.setExperimentTaskStatus(taskId, status))
+  ipcMain.handle('experiments:startRun', (_event, taskId: string, input: ExperimentRunStartInput) => store.startExperimentRun(taskId, experimentRunStartInputSchema.parse(input)))
+  ipcMain.handle('experiments:cancelQueuedRun', (_event, taskId: string, runId: string) => store.cancelQueuedExperimentRun(taskId, runId))
+  ipcMain.handle('experiments:finishRun', (_event, taskId: string, runId: string, input: ExperimentRunFinishInput) => store.finishExperimentRun(taskId, runId, input))
+  ipcMain.handle('experiments:setArchived', (_event, taskId: string, archived: boolean) => store.setExperimentTaskArchived(taskId, archived))
+  ipcMain.handle('experiments:listCondaEnvironments', (_event, serverId: string, accessRouteId: string, manager: CondaManager, managerPath?: string) => {
+    if (!['conda', 'mamba', 'micromamba'].includes(manager)) throw new Error('Conda 管理器无效')
+    if (managerPath !== undefined && (typeof managerPath !== 'string' || managerPath.length > 4096 || managerPath.includes('\0'))) throw new Error('Conda 可执行文件路径无效')
+    return withRemoteConda(store, ssh, serverId, accessRouteId, (profile, secrets) =>
+      conda.listEnvironments(profile, secrets, manager, managerPath)
+    )
+  })
+  ipcMain.handle('experiments:checkCondaEnvironment', (_event, serverId: string, accessRouteId: string, rawConfig: CondaEnvironmentConfig) => {
+    const config = condaEnvironmentConfigSchema.parse(rawConfig)
+    return withRemoteConda(store, ssh, serverId, accessRouteId, (profile, secrets) =>
+      conda.checkEnvironment(profile, secrets, config)
+    )
+  })
+  ipcMain.handle('experiments:getCondaEnvironmentCommand', (_event, rawConfig: CondaEnvironmentConfig, updateExisting: boolean) => {
+    const config = condaEnvironmentConfigSchema.parse(rawConfig)
+    if (typeof updateExisting !== 'boolean') throw new Error('Conda 环境操作类型无效')
+    return conda.buildEnvironmentCommand(config, updateExisting)
   })
 
   ipcMain.handle('settings:get', () => store.getSettings())
   ipcMain.handle('settings:save', async (_event, settings: AppSettings) => {
     const previous = store.getSettings()
     const saved = await store.saveSettings(settings)
+    monitor.setPollingInterval(saved.pollingIntervalSeconds)
     trackGpuWatchChanges(previous, saved)
     return saved
   })
@@ -547,6 +637,8 @@ app.whenReady().then(async () => {
 })
 
 app.on('before-quit', (event) => {
+  experimentScheduler?.stop()
+  monitorService?.closeAll()
   if (quittingAfterTerminalCleanup || !terminalManager) return
   event.preventDefault()
   quittingAfterTerminalCleanup = true

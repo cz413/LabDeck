@@ -138,12 +138,12 @@ export function ServerDialog({ server, onClose, onSaved }: ServerDialogProps): R
 
   return (
     <div className="modal-backdrop app-modal-overlay" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && onClose()}>
-      <div className="server-dialog app-modal" role="dialog" aria-modal="true" aria-label="添加服务器">
-        <div className="dialog-header">
+      <div className="server-dialog app-modal" role="dialog" aria-modal="true" aria-labelledby="server-dialog-title">
+        <div className="dialog-header app-modal-header">
           <div className="dialog-title-wrap">
             <div className="dialog-icon"><Server size={20} /></div>
             <div>
-              <h2>{server ? '编辑服务器' : '添加真实服务器'}</h2>
+              <h2 id="server-dialog-title">{server ? '编辑服务器' : '添加真实服务器'}</h2>
               <p>连接凭据仅加密保存在当前 Windows 用户下</p>
             </div>
           </div>
@@ -239,7 +239,7 @@ export function ServerDialog({ server, onClose, onSaved }: ServerDialogProps): R
           </div>
 
           {error && <div className="form-error">{error}</div>}
-          <div className="dialog-footer">
+          <div className="dialog-footer app-modal-footer">
             <button type="button" className="secondary-button" onClick={onClose}>取消</button>
             <button type="submit" className="primary-button" disabled={saving}>{saving ? '正在保存…' : '保存服务器'}</button>
           </div>

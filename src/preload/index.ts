@@ -2,6 +2,12 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type {
   AppApi,
   AppSettings,
+  CondaEnvironmentConfig,
+  CondaManager,
+  ExperimentRunFinishInput,
+  ExperimentRunStartInput,
+  ExperimentTaskDraft,
+  ExperimentTaskStatus,
   GpuAvailableEvent,
   ServerProfileInput,
   SftpTransferProgress,
@@ -36,7 +42,6 @@ const api: AppApi = {
     choosePrivateKey: () => ipcRenderer.invoke('servers:choosePrivateKey')
   },
   sshConfig: {
-    scan: () => ipcRenderer.invoke('sshConfig:scan'),
     importAll: () => ipcRenderer.invoke('sshConfig:importAll')
   },
   monitor: {
@@ -66,7 +71,12 @@ const api: AppApi = {
     }
   },
   sftp: {
-    openWindow: (serverId: string, accessRouteId?: string) => ipcRenderer.invoke('sftp:openWindow', serverId, accessRouteId),
+    openWindow: (serverId: string, accessRouteId?: string, initialPath?: string) => ipcRenderer.invoke('sftp:openWindow', serverId, accessRouteId, initialPath),
+    onNavigate: (listener: (path: string) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, path: string): void => listener(path)
+      ipcRenderer.on('sftp:navigate', handler)
+      return () => ipcRenderer.removeListener('sftp:navigate', handler)
+    },
     list: (serverId: string, path: string, accessRouteId?: string) => ipcRenderer.invoke('sftp:list', serverId, path, accessRouteId),
     chooseUploadFile: () => ipcRenderer.invoke('sftp:chooseUploadFile'),
     upload: (serverId: string, localPath: string, remotePath: string, transferId: string, accessRouteId?: string) =>
@@ -80,7 +90,27 @@ const api: AppApi = {
     }
   },
   vscode: {
-    openRemote: (serverId: string, accessRouteId?: string) => ipcRenderer.invoke('vscode:openRemote', serverId, accessRouteId)
+    openRemote: (serverId: string, accessRouteId?: string, remotePath?: string) => ipcRenderer.invoke('vscode:openRemote', serverId, accessRouteId, remotePath)
+  },
+  experiments: {
+    list: () => ipcRenderer.invoke('experiments:list'),
+    save: (input: ExperimentTaskDraft) => ipcRenderer.invoke('experiments:save', input),
+    setStatus: (taskId: string, status: ExperimentTaskStatus) => ipcRenderer.invoke('experiments:setStatus', taskId, status),
+    startRun: (taskId: string, input: ExperimentRunStartInput) => ipcRenderer.invoke('experiments:startRun', taskId, input),
+    cancelQueuedRun: (taskId: string, runId: string) => ipcRenderer.invoke('experiments:cancelQueuedRun', taskId, runId),
+    finishRun: (taskId: string, runId: string, input: ExperimentRunFinishInput) => ipcRenderer.invoke('experiments:finishRun', taskId, runId, input),
+    onChanged: (listener: () => void) => {
+      const handler = (): void => listener()
+      ipcRenderer.on('experiments:changed', handler)
+      return () => ipcRenderer.removeListener('experiments:changed', handler)
+    },
+    setArchived: (taskId: string, archived: boolean) => ipcRenderer.invoke('experiments:setArchived', taskId, archived),
+    listCondaEnvironments: (serverId: string, accessRouteId: string, manager: CondaManager, managerPath?: string) =>
+      ipcRenderer.invoke('experiments:listCondaEnvironments', serverId, accessRouteId, manager, managerPath),
+    checkCondaEnvironment: (serverId: string, accessRouteId: string, config: CondaEnvironmentConfig) =>
+      ipcRenderer.invoke('experiments:checkCondaEnvironment', serverId, accessRouteId, config),
+    getCondaEnvironmentCommand: (config: CondaEnvironmentConfig, updateExisting: boolean) =>
+      ipcRenderer.invoke('experiments:getCondaEnvironmentCommand', config, updateExisting)
   },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
