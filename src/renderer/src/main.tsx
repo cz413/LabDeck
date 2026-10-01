@@ -1,6 +1,7 @@
 import ReactDOM from 'react-dom/client'
 import '@xterm/xterm/css/xterm.css'
 import './styles.css'
+import './workbench.css'
 import { App } from './App'
 import { SftpWindowApp } from './components/SftpPanel'
 

@@ -17,10 +17,10 @@ interface SeriesDefinition {
 }
 
 const series: SeriesDefinition[] = [
-  { key: 'util', label: '利用率', unit: '%', color: '#58b8ae', value: (point) => point.utilizationPercent, domain: () => [0, 100] },
-  { key: 'memory', label: '显存', unit: '%', color: '#6f8fb5', value: (point) => point.memoryTotalMiB ? point.memoryUsedMiB / point.memoryTotalMiB * 100 : 0, domain: () => [0, 100] },
-  { key: 'temperature', label: '温度', unit: '°C', color: '#d3a252', value: (point) => point.temperatureC, domain: () => [20, 100] },
-  { key: 'power', label: '功耗', unit: 'W', color: '#9b8bb8', value: (point) => point.powerW, domain: (points) => [0, Math.max(100, ...points.map((point) => point.powerW ?? 0))] }
+  { key: 'util', label: '利用率', unit: '%', color: 'var(--blue)', value: (point) => point.utilizationPercent, domain: () => [0, 100] },
+  { key: 'memory', label: '显存', unit: '%', color: 'var(--chart-memory)', value: (point) => point.memoryTotalMiB ? point.memoryUsedMiB / point.memoryTotalMiB * 100 : 0, domain: () => [0, 100] },
+  { key: 'temperature', label: '温度', unit: '°C', color: 'var(--amber)', value: (point) => point.temperatureC, domain: () => [20, 100] },
+  { key: 'power', label: '功耗', unit: 'W', color: 'var(--violet)', value: (point) => point.powerW, domain: (points) => [0, Math.max(100, ...points.map((point) => point.powerW ?? 0))] }
 ]
 
 export function GpuHistoryChart({ points, range, loading, onRangeChange }: GpuHistoryChartProps): React.JSX.Element {
@@ -57,7 +57,7 @@ function Sparkline({ definition, points }: { definition: SeriesDefinition; point
     : definition.key === 'power'
       ? (latest ?? 0) / Math.max(1, max) * 100
       : latest ?? 0
-  const lineColor = severityPercent >= 90 ? '#e15f67' : severityPercent >= 70 ? '#d6a348' : severityPercent >= 40 ? '#4d9ed1' : definition.color
+  const lineColor = severityPercent >= 90 ? 'var(--red)' : severityPercent >= 70 ? 'var(--amber)' : severityPercent >= 40 ? 'var(--blue)' : definition.color
   return <div className="history-series">
     <div><span>{definition.label}</span><strong style={{ color: lineColor }}>{latest === undefined ? '—' : `${Math.round(latest)}${definition.unit}`}</strong></div>
     <svg viewBox="0 0 100 32" preserveAspectRatio="none" role="img" aria-label={`${definition.label}历史曲线`}>

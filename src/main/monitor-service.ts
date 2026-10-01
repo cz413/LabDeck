@@ -124,12 +124,18 @@ export class MonitorService {
       connection.lastUsedAt = Date.now()
       return raw
     } catch (error) {
-      if (!connection.closed || this.shuttingDown) throw error
+      const disconnected = connection.closed
       this.retireConnection(connection)
+      if (!disconnected || this.shuttingDown) throw error
       connection = await this.getConnection(profile, secrets, key)
-      const raw = await this.ssh.exec(connection.client, METRICS_COMMAND, 15000)
-      connection.lastUsedAt = Date.now()
-      return raw
+      try {
+        const raw = await this.ssh.exec(connection.client, METRICS_COMMAND, 15000)
+        connection.lastUsedAt = Date.now()
+        return raw
+      } catch (retryError) {
+        this.retireConnection(connection)
+        throw retryError
+      }
     }
   }
 

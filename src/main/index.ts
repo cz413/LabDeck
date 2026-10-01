@@ -87,7 +87,7 @@ function createWindow(store: AppStore): void {
     frame: false,
     thickFrame: true,
     icon: appIconPath,
-    backgroundColor: '#07111f',
+    backgroundColor: '#202225',
     title: 'LabDeck · 实验室算力工作台',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
@@ -586,8 +586,25 @@ function registerIpc(store: AppStore): void {
   ipcMain.handle('experiments:list', () => store.listExperimentTasks())
   ipcMain.handle('experiments:save', (_event, input: ExperimentTaskDraft) => store.saveExperimentTask(input))
   ipcMain.handle('experiments:setStatus', (_event, taskId: string, status: ExperimentTaskStatus) => store.setExperimentTaskStatus(taskId, status))
-  ipcMain.handle('experiments:startRun', (_event, taskId: string, input: ExperimentRunStartInput) => store.startExperimentRun(taskId, experimentRunStartInputSchema.parse(input)))
+  ipcMain.handle('experiments:startRun', async (_event, taskId: string, input: ExperimentRunStartInput) => {
+    const task = await store.startExperimentRun(taskId, experimentRunStartInputSchema.parse(input))
+    experimentScheduler?.wake()
+    return task
+  })
   ipcMain.handle('experiments:cancelQueuedRun', (_event, taskId: string, runId: string) => store.cancelQueuedExperimentRun(taskId, runId))
+  ipcMain.handle('experiments:cancelRun', (_event, taskId: string, runId: string) => {
+    if (!experimentScheduler) throw new Error('实验任务调度器尚未启动')
+    return experimentScheduler.cancelRun(taskId, runId)
+  })
+  ipcMain.handle('experiments:deleteQueuedRun', async (_event, taskId: string, runId: string) => {
+    const task = await store.deleteQueuedExperimentRun(taskId, runId)
+    if (!task && mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('experiments:changed')
+    return task
+  })
+  ipcMain.handle('experiments:deleteTask', async (_event, taskId: string) => {
+    await store.deleteExperimentTask(taskId)
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('experiments:changed')
+  })
   ipcMain.handle('experiments:finishRun', (_event, taskId: string, runId: string, input: ExperimentRunFinishInput) => store.finishExperimentRun(taskId, runId, input))
   ipcMain.handle('experiments:setArchived', (_event, taskId: string, archived: boolean) => store.setExperimentTaskArchived(taskId, archived))
   ipcMain.handle('experiments:listCondaEnvironments', (_event, serverId: string, accessRouteId: string, manager: CondaManager, managerPath?: string) => {

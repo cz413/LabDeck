@@ -6,11 +6,11 @@ import {
   CheckCircle2,
   Check,
   ChevronRight,
-  CircleUserRound,
+  ChevronDown,
+  ChevronUp,
   Code2,
   Copy,
   Cpu,
-  Database,
   FolderOpen,
   FileDown,
   GitMerge,
@@ -31,25 +31,24 @@ import {
   ShieldCheck,
   Square,
   SquareTerminal,
-  Thermometer,
   Trash2,
-  WifiOff,
   X,
-  Zap,
   XCircle
 } from 'lucide-react'
-import type { AppSettings, ConnectionTestResult, ExperimentTask, GpuProcessMetric, GpuWatchTarget, MonitorPolicy, ServerProfile, ServerSnapshot } from '@shared/types'
-import { gpuLoadState, gpuMemoryPercent, gpuRecommendation, isGpuBusy } from '@shared/gpu-status'
+import type { AppSettings, ConnectionTestResult, ExperimentTask, GpuMetric, GpuProcessMetric, GpuWatchTarget, MonitorPolicy, ServerProfile, ServerSnapshot } from '@shared/types'
+import { isGpuBusy } from '@shared/gpu-status'
 import { getAccessRoute, getAccessRoutes, getDefaultAccessRouteId, routeLabel } from '@shared/access-routes'
 import { ServerDialog } from './components/ServerDialog'
 import { AccessRouteSelect } from './components/AccessRouteSelect'
 import { GpuDetailPanel } from './components/GpuDetailPanel'
 import { ServerTerminalWorkspace, type ServerTerminalSession, type TerminalWorkspaceSession } from './components/ServerTerminalWorkspace'
-import { ServerDetailPage } from './components/ServerDetailPage'
+import { GpuResourcePool } from './components/GpuResourcePool'
 import { ConfirmDialog, type ConfirmationRequest } from './components/ConfirmDialog'
 import { ExperimentTaskPool } from './components/ExperimentTaskPool'
+import { ResourceWorkbench } from './components/ResourceWorkbench'
+import { SftpPanel } from './components/SftpPanel'
 
-type Page = 'dashboard' | 'gpus' | 'tasks' | 'servers' | 'serverDetail' | 'terminals' | 'alerts' | 'settings'
+type Page = 'gpus' | 'tasks' | 'servers' | 'serverDetail' | 'gpuDetail' | 'terminals' | 'files' | 'alerts' | 'settings'
 type GpuSelection = { server: ServerProfile; gpuIndex: number } | null
 
 interface UserGpuTask {
@@ -122,7 +121,7 @@ function LabDeckMark(): React.JSX.Element {
 }
 
 export function App(): React.JSX.Element {
-  const [page, setPage] = useState<Page>('dashboard')
+  const [page, setPage] = useState<Page>('serverDetail')
   const [servers, setServers] = useState<ServerProfile[]>([])
   const [experimentTasks, setExperimentTasks] = useState<ExperimentTask[]>([])
   const [snapshots, setSnapshots] = useState<Record<string, ServerSnapshot>>({})
@@ -132,9 +131,13 @@ export function App(): React.JSX.Element {
   const [dialogServer, setDialogServer] = useState<ServerProfile | null | undefined>(undefined)
   const [terminalSessions, setTerminalSessions] = useState<TerminalWorkspaceSession[]>([])
   const [activeTerminalSessionId, setActiveTerminalSessionId] = useState<string | null>(null)
+  const [terminalDockOpen, setTerminalDockOpen] = useState(false)
+  const [fileTarget, setFileTarget] = useState<{ serverId: string; routeId: string; path?: string } | null>(null)
+  const [taskRequest, setTaskRequest] = useState<{ id: number; taskId?: string; serverId?: string; accessRouteId?: string; gpu?: GpuMetric } | null>(null)
   const [pendingConfirmation, setPendingConfirmation] = useState<ConfirmationRequest | null>(null)
   const [selectedServerId, setSelectedServerId] = useState<string | null>(null)
   const [gpuSelection, setGpuSelection] = useState<GpuSelection>(null)
+  const [gpuPoolFilters, setGpuPoolFilters] = useState({ server: 'all', model: 'all', state: 'all' })
   const [testingId, setTestingId] = useState<string | null>(null)
   const [toasts, setToasts] = useState<Toast[]>([])
   const [vscodeConnectingId, setVsCodeConnectingId] = useState<string | null>(null)
@@ -146,17 +149,19 @@ export function App(): React.JSX.Element {
   const [closePromptOpen, setClosePromptOpen] = useState(false)
   const [rememberCloseChoice, setRememberCloseChoice] = useState(false)
   const [accessRouteSelections, setAccessRouteSelections] = useState<Record<string, string>>({})
+  const accessRouteSelectionsRef = useRef(accessRouteSelections)
+  accessRouteSelectionsRef.current = accessRouteSelections
   const retryState = useRef<Record<string, { failures: number; nextRetryAt: number }>>({})
   const snapshotRefreshInFlight = useRef(false)
   const pendingForcedSnapshots = useRef<Map<string, ServerProfile>>(new Map())
   const nextTerminalNumber = useRef(1)
   const nextLocalTerminalNumber = useRef(1)
   const confirmationResolver = useRef<((confirmed: boolean) => void) | null>(null)
-  const previousPage = useRef<Page>('dashboard')
-  const serverDetailReturnPage = useRef<Page>('dashboard')
+  const previousPage = useRef<Page>('serverDetail')
+  const gpuReturnPage = useRef<Page>('gpus')
 
   const accessRouteIdFor = (server: ServerProfile): string => {
-    const selected = accessRouteSelections[server.id]
+    const selected = accessRouteSelectionsRef.current[server.id]
     return selected && getAccessRoutes(server).some((route) => route.id === selected)
       ? selected
       : getDefaultAccessRouteId(server)
@@ -164,6 +169,8 @@ export function App(): React.JSX.Element {
 
   const selectAccessRoute = (server: ServerProfile, routeId: string): void => {
     if (!getAccessRoutes(server).some((route) => route.id === routeId)) return
+    // Refreshes may start before React renders, or drain an older queued batch.
+    accessRouteSelectionsRef.current = { ...accessRouteSelectionsRef.current, [server.id]: routeId }
     setAccessRouteSelections((current) => ({ ...current, [server.id]: routeId }))
     if (server.monitorPolicy !== 'manual') void refreshSnapshots([server], { force: true })
   }
@@ -289,23 +296,24 @@ export function App(): React.JSX.Element {
   useEffect(() => {
     const watchedServerIds = new Set(settings.gpuWatches.map((watch) => watch.serverId))
     const backgroundServers = servers.filter((server) => server.monitorPolicy === 'background' || watchedServerIds.has(server.id))
-    if (!settings.monitoringEnabled || !backgroundServers.length) return
+    if (loading || !settings.monitoringEnabled || !backgroundServers.length) return
     const intervalMs = settings.pollingIntervalSeconds * 1000
-    let intervalTimer: number | undefined
     const initialTimer = window.setTimeout(() => {
       void refreshSnapshots(backgroundServers)
-      intervalTimer = window.setInterval(() => void refreshSnapshots(backgroundServers), intervalMs)
-    }, Math.floor(Math.random() * intervalMs))
+    }, 0)
+    const intervalTimer = window.setInterval(() => void refreshSnapshots(backgroundServers), intervalMs)
     return () => {
       window.clearTimeout(initialTimer)
-      if (intervalTimer !== undefined) window.clearInterval(intervalTimer)
+      window.clearInterval(intervalTimer)
     }
-  }, [settings.monitoringEnabled, settings.pollingIntervalSeconds, settings.maxConcurrentPolls, settings.gpuWatches, servers, accessRouteSelections])
+  }, [loading, settings.monitoringEnabled, settings.pollingIntervalSeconds, settings.maxConcurrentPolls, settings.gpuWatches, servers, accessRouteSelections])
 
   useEffect(() => window.labApi.notifications.onGpuAvailable((event) => {
     const server = servers.find((item) => item.id === event.serverId)
     if (!server) return
-    setPage('gpus')
+    gpuReturnPage.current = 'gpus'
+    setSelectedServerId(server.id)
+    setPage('gpuDetail')
     setGpuSelection({ server, gpuIndex: event.gpuIndex })
   }), [servers])
 
@@ -366,9 +374,13 @@ export function App(): React.JSX.Element {
     setDragOverShortcutServerId(null)
   }
 
-  const selectedServer = selectedServerId
-    ? servers.find((server) => server.id === selectedServerId)
-    : undefined
+  const selectedServer = servers.find((server) => server.id === selectedServerId) ?? orderedShortcutServers[0]
+
+  useEffect(() => {
+    if (!loading && page === 'serverDetail' && selectedServer?.monitorPolicy === 'onView') {
+      void refreshSnapshots([selectedServer], { force: true })
+    }
+  }, [loading, page, selectedServer?.id])
 
   const summary = useMemo(() => {
     const values = servers.map((server) => snapshots[server.id])
@@ -426,9 +438,10 @@ export function App(): React.JSX.Element {
     const route = getAccessRoute(server, accessRouteId)
     const defaultPath = `/home/${route.username.trim() || 'user'}`
     const targetPath = initialPath?.startsWith('/') ? initialPath : defaultPath
-    void window.labApi.sftp.openWindow(server.id, accessRouteId, targetPath).catch((error: unknown) => {
-      notify(error instanceof Error ? error.message : '无法打开文件传输窗口', 'error')
-    })
+    setSelectedServerId(server.id)
+    setAccessRouteSelections((current) => ({ ...current, [server.id]: accessRouteId }))
+    setFileTarget({ serverId: server.id, routeId: accessRouteId, path: targetPath })
+    setPage('files')
   }
 
   const openVsCode = async (server: ServerProfile, accessRouteId = accessRouteIdFor(server), remotePath?: string): Promise<void> => {
@@ -481,7 +494,7 @@ export function App(): React.JSX.Element {
     const session = createTerminalSession(server, accessRouteId, remotePath, initialCommand, label)
     setActiveTerminalSessionId(session.id)
     setSelectedServerId(server.id)
-    setPage('terminals')
+    setTerminalDockOpen(true)
     return true
   }
 
@@ -501,7 +514,7 @@ export function App(): React.JSX.Element {
     }
     setTerminalSessions((current) => [...current, session])
     setActiveTerminalSessionId(session.id)
-    setPage('terminals')
+    setTerminalDockOpen(true)
   }
 
   const updateTerminalWorkingDirectory = (sessionId: string, path: string): void => {
@@ -526,7 +539,7 @@ export function App(): React.JSX.Element {
     const session = existing ?? createTerminalSession(server, accessRouteId)
     setActiveTerminalSessionId(session.id)
     setSelectedServerId(server.id)
-    setPage('terminals')
+    setTerminalDockOpen(true)
   }
 
   const addTerminalSession = (server: ServerProfile, accessRouteId = accessRouteIdFor(server)): void => {
@@ -537,7 +550,7 @@ export function App(): React.JSX.Element {
     }
     createTerminalSession(server, accessRouteId)
     setSelectedServerId(server.id)
-    setPage('terminals')
+    setTerminalDockOpen(true)
   }
 
   const closeTerminalSession = async (sessionId: string): Promise<void> => {
@@ -561,10 +574,8 @@ export function App(): React.JSX.Element {
   }
 
   const openServerDetail = (server: ServerProfile): void => {
-    if (page !== 'serverDetail') serverDetailReturnPage.current = page
     setSelectedServerId(server.id)
     setPage('serverDetail')
-    if (server.monitorPolicy === 'onView') void refreshSnapshots([server], { force: true })
   }
 
   const testServer = async (server: ServerProfile): Promise<void> => {
@@ -735,6 +746,12 @@ export function App(): React.JSX.Element {
     setPage(nextPage)
   }
 
+  function openGpu(server: ServerProfile, gpuIndex: number): void {
+    if (page !== 'gpuDetail') gpuReturnPage.current = page
+    setSelectedServerId(server.id)
+    setGpuSelection({ server, gpuIndex })
+    setPage('gpuDetail')
+  }
   const resolveCloseAction = async (action: 'tray' | 'exit' | 'cancel'): Promise<void> => {
     setClosePromptOpen(false)
     try {
@@ -745,121 +762,90 @@ export function App(): React.JSX.Element {
     }
   }
 
+  const showTerminal = !loading && (page === 'terminals' || terminalDockOpen)
+  const resourceActive = ['servers', 'serverDetail', 'gpuDetail', 'gpus'].includes(page)
+  const openTask = (task?: ExperimentTask, gpu?: GpuMetric): void => {
+    setTaskRequest({ id: Date.now(), taskId: task?.id, serverId: selectedServer?.id, accessRouteId: selectedServer ? accessRouteIdFor(selectedServer) : undefined, gpu })
+    setPage('tasks')
+  }
+  const taskPool = <ExperimentTaskPool
+    tasks={experimentTasks} servers={servers} snapshots={snapshots}
+    liveTasks={<MyTasksPage tasks={myTasks} onOpenGpu={(server, gpuIndex) => openGpu(server, gpuIndex)} />}
+    liveTaskCount={myTasks.length} vscodeConnectingId={vscodeConnectingId}
+    onChanged={updateExperimentTask} notify={notify} confirm={requestConfirmation}
+    onTrusted={async () => { await loadServers() }}
+    onOpenTerminal={openExperimentTerminal} onOpenFiles={openSftp}
+    onOpenVsCode={(server, routeId, path) => void openVsCode(server, routeId, path)}
+    request={taskRequest} onRequestHandled={() => setTaskRequest(null)} defaultServerId={selectedServer?.id}
+  />
+  const fileServer = servers.find((server) => server.id === fileTarget?.serverId) ?? selectedServer
+  const fileRouteId = fileServer ? (fileTarget?.serverId === fileServer.id ? fileTarget.routeId : accessRouteIdFor(fileServer)) : undefined
+  const filePath = fileTarget?.serverId === fileServer?.id ? fileTarget?.path : undefined
+  const browserServers = orderedShortcutServers.filter((server) => filteredServers.some((item) => item.id === server.id))
+
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <div className="brand-mark"><LabDeckMark /></div>
-          <div className="brand-wordmark"><strong>LabDeck</strong><span>实验室算力工作台</span></div>
+    <div className="app-shell workbench-shell">
+      <header className="workbench-titlebar">
+        <span className="workbench-wordmark"><LabDeckMark />LabDeck</span>
+        <div className="window-controls" aria-label="窗口控制">
+          <button onClick={() => window.labApi.windowControls.minimize()} aria-label="最小化"><Minus size={13} /></button>
+          <button onClick={() => void window.labApi.windowControls.toggleMaximize().then(setWindowMaximized)} aria-label={windowMaximized ? '还原窗口' : '最大化'}>{windowMaximized ? <Copy size={12} /> : <Square size={12} />}</button>
+          <button className="window-close" onClick={() => window.labApi.windowControls.close()} aria-label="关闭"><X size={14} /></button>
         </div>
-        <nav>
-          <div className="nav-caption">工作区</div>
-          <NavButton active={page === 'dashboard'} icon={<LayoutDashboard size={18} />} label="运行总览" onClick={() => goToPage('dashboard')} />
-          <NavButton active={page === 'gpus'} icon={<Cpu size={18} />} label="GPU 资源" badge={summary.gpuCount} onClick={() => goToPage('gpus')} />
-          <NavButton active={page === 'servers' || page === 'serverDetail'} icon={<ServerIcon size={18} />} label="服务器" badge={servers.length} onClick={() => goToPage('servers')} />
-          <NavButton active={page === 'tasks'} icon={<ListTodo size={18} />} label="我的任务" badge={myTasks.length} onClick={() => goToPage('tasks')} />
-          <NavButton active={page === 'terminals'} icon={<SquareTerminal size={18} />} label="终端" badge={terminalSessions.length || undefined} onClick={() => goToPage('terminals')} />
-          <div className="nav-caption second server-shortcut-caption"><span>服务器快捷入口</span><b>{servers.length}</b></div>
-          <div className="sidebar-server-list">
-            {orderedShortcutServers.map((server) => <SidebarServerLink key={server.id} server={server} snapshot={snapshots[server.id]} active={page === 'serverDetail' && selectedServerId === server.id} dragging={draggedShortcutServerId === server.id} dragOver={dragOverShortcutServerId === server.id} onClick={() => openServerDetail(server)} onDragStart={(event) => startShortcutDrag(event, server)} onDragEnd={() => { setDraggedShortcutServerId(null); setDragOverShortcutServerId(null) }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDragOverShortcutServerId(server.id) }} onDrop={(event) => dropShortcutServer(event, server)} />)}
-            {!servers.length && <span className="sidebar-server-empty">还没有服务器</span>}
+      </header>
+      <nav className="workbench-modulebar" aria-label="主要模块">
+        <NavButton active={resourceActive} icon={<ServerIcon size={16} />} label="资源" onClick={() => goToPage('serverDetail')} />
+        <NavButton active={page === 'tasks'} icon={<ListTodo size={16} />} label="实验任务" onClick={() => goToPage('tasks')} />
+        <NavButton active={page === 'terminals'} icon={<SquareTerminal size={16} />} label="终端" badge={terminalSessions.length || undefined} onClick={() => goToPage('terminals')} />
+        <NavButton active={page === 'files'} icon={<FolderOpen size={16} />} label="文件" onClick={() => { if (selectedServer && fileTarget?.serverId !== selectedServer.id) openSftp(selectedServer); else goToPage('files') }} />
+        <label className="workbench-search"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索服务器" aria-label="搜索服务器" /></label>
+        <button className={page === 'alerts' ? 'active' : ''} onClick={() => goToPage('alerts')}><Bell size={15} />告警{alerts.length > 0 && <b>{alerts.length}</b>}</button>
+        <button className={page === 'settings' ? 'active' : ''} onClick={() => goToPage('settings')}><Settings size={15} />设置</button>
+      </nav>
+      <div className="workbench-body">
+        <aside className="workbench-browser" aria-label="服务器资源列表">
+          <header><h2>服务器</h2><button className="icon-button small" aria-label="添加服务器" title="添加服务器" onClick={() => setDialogServer(null)}><Plus size={16} /></button></header>
+          <div className="workbench-browser-links"><button className={page === 'servers' ? 'active' : ''} onClick={() => goToPage('servers')}>全部服务器</button><button className={page === 'gpus' ? 'active' : ''} onClick={() => goToPage('gpus')}>GPU 总览</button></div>
+          <div className="workbench-server-tree">
+            {[...new Set(browserServers.map((server) => server.group || '未分组'))].map((group) => <details key={group} open className="workbench-server-group"><summary>{group}<small>{browserServers.filter((server) => (server.group || '未分组') === group).length}</small></summary><div>
+              {browserServers.filter((server) => (server.group || '未分组') === group).map((server) => <SidebarServerLink key={server.id} server={server} accessRouteId={accessRouteIdFor(server)} snapshot={snapshots[server.id]} active={selectedServer?.id === server.id} dragging={draggedShortcutServerId === server.id} dragOver={dragOverShortcutServerId === server.id}
+                onClick={() => { if (page === 'files') openSftp(server); else openServerDetail(server) }}
+                onDragStart={(event) => startShortcutDrag(event, server)} onDragEnd={() => { setDraggedShortcutServerId(null); setDragOverShortcutServerId(null) }}
+                onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDragOverShortcutServerId(server.id) }} onDrop={(event) => dropShortcutServer(event, server)} />)}
+            </div></details>)}
+            {!browserServers.length && <p className="workbench-browser-empty">{servers.length ? '没有匹配的服务器' : '添加服务器或导入 SSH Config 开始使用。'}</p>}
           </div>
-        </nav>
-        <div className="sidebar-bottom">
-          <div className="local-badge"><ShieldCheck size={16} /><div><strong>本地安全模式</strong><span>凭据由 Windows 加密</span></div></div>
-          <button type="button" className={`sidebar-settings-entry ${page === 'settings' ? 'active' : ''}`} onClick={() => goToPage('settings')}>
-            <Settings size={18} />
-            <span><strong>偏好设置</strong><small>主题、监控与通知</small></span>
-            <ChevronRight size={16} />
-          </button>
-        </div>
-      </aside>
-
-      <main className="main-content">
-        <header className="topbar">
-          <div className="page-heading">
-            <h1>{page === 'serverDetail' ? (selectedServer?.name ?? '服务器详情') : page === 'dashboard' ? '运行总览' : page === 'gpus' ? 'GPU 资源' : page === 'tasks' ? '我的任务' : page === 'servers' ? '服务器管理' : page === 'terminals' ? '终端' : page === 'alerts' ? '告警中心' : '偏好设置'}</h1>
-            <p>{page === 'serverDetail' && selectedServer ? (() => { const route = getAccessRoute(selectedServer, accessRouteIdFor(selectedServer)); return `${route.host}:${route.port} · ${routeLabel(selectedServer, accessRouteIdFor(selectedServer))} · ${statusLabel(snapshots[selectedServer.id])}` })() : page === 'terminals' ? `${terminalSessions.length} 个会话 · 本地与 SSH 终端在同一工作区运行` : page === 'tasks' ? `${experimentTasks.filter((task) => !task.archived).length} 个实验任务 · ${experimentTasks.filter((task) => !task.archived && task.status === 'queued').length} 个等待 GPU · ${experimentTasks.filter((task) => !task.archived && task.status === 'running').length} 个正在运行 · ${myTasks.length} 个实时 GPU 进程` : new Date().toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric', weekday: 'long' })}</p>
+          <footer><button onClick={() => void importSshConfig()} disabled={importingConfig}><FileDown size={13} />{importingConfig ? '导入中…' : '导入 SSH Config'}</button><span>{servers.length} 台服务器 · {summary.gpuCount} 张 GPU</span><small>{settings.monitoringEnabled ? '持续监控已启用' : '后台监控已关闭'}</small></footer>
+        </aside>
+        <main className="main-content workbench-main">
+          <div className={`page-content workbench-page ${page === 'terminals' ? 'terminal-full-page' : ''}`}>
+            {loading ? <LoadingState /> : page === 'serverDetail' ? (selectedServer ? <ResourceWorkbench key={selectedServer.id}
+              server={selectedServer} snapshot={snapshots[selectedServer.id]} initialGpuIndex={gpuSelection?.server.id === selectedServer.id ? gpuSelection.gpuIndex : undefined} tasks={experimentTasks} watches={settings.gpuWatches}
+              accessRouteId={accessRouteIdFor(selectedServer)} onAccessRouteChange={(id) => selectAccessRoute(selectedServer, id)}
+              refreshing={refreshing} testing={testingId === selectedServer.id} vscodeConnecting={vscodeConnectingId === selectedServer.id}
+              onRefresh={() => void refreshSnapshots([selectedServer], { force: true })} onTerminal={() => openServerTerminal(selectedServer)}
+              onFiles={(path) => openSftp(selectedServer, accessRouteIdFor(selectedServer), path)} onVsCode={() => void openVsCode(selectedServer)} onEdit={() => setDialogServer(selectedServer)}
+              onTest={() => void testServer(selectedServer)} onRemove={() => void removeServer(selectedServer)} onMerge={() => void mergeServerPath(selectedServer)}
+              onTask={(task) => openTask(task)} onNewTask={(gpu) => openTask(undefined, gpu)} onGpuDetail={(gpuIndex) => openGpu(selectedServer, gpuIndex)}
+              onToggleWatch={(gpuUuid) => void toggleGpuWatch({ serverId: selectedServer.id, gpuUuid })}
+            /> : <div className="workbench-welcome"><ServerIcon size={28} /><h1>还没有服务器</h1><p>导入 SSH Config 或添加服务器，查看 GPU 并调度实验。</p><button className="secondary-button" onClick={() => setDialogServer(null)}><Plus size={15} />添加服务器</button><button className="wb-text-button" onClick={() => void importSshConfig()}>导入 SSH Config</button></div>) : page === 'gpuDetail' && gpuSelection ? <GpuDetailPanel key={gpuSelection.server.id} server={servers.find(server => server.id === gpuSelection.server.id) ?? gpuSelection.server} snapshot={snapshots[gpuSelection.server.id]} initialGpuIndex={gpuSelection.gpuIndex} watches={settings.gpuWatches} accessRouteId={accessRouteIdFor(gpuSelection.server)} onToggleWatch={(gpuUuid) => void toggleGpuWatch({ serverId: gpuSelection.server.id, gpuUuid })} onClose={() => setPage(gpuReturnPage.current)} refreshing={refreshing} onRefresh={() => void refreshSnapshots([gpuSelection.server], { force: true })} onTerminal={() => openServerTerminal(gpuSelection.server)} onRun={(gpu) => openTask(undefined, gpu)} onSelectGpu={(gpuIndex) => setGpuSelection({ server: gpuSelection.server, gpuIndex })} /> : page === 'tasks' ? <><header className="workbench-page-heading"><h1>实验任务</h1><span>任务配置、排队与运行记录</span></header>{taskPool}</> : page === 'files' ? (fileServer && fileRouteId ? <div className="workbench-files"><div className="workbench-file-route"><AccessRouteSelect server={fileServer} value={fileRouteId} onChange={(id) => openSftp(fileServer, id)} /></div><SftpPanel key={`${fileServer.id}:${fileRouteId}`} server={fileServer} accessRouteId={fileRouteId} initialPath={filePath} onClose={() => goToPage('serverDetail')} onMessage={notify} /></div> : <div className="workbench-welcome"><FolderOpen size={28} /><h1>选择一台服务器</h1><p>从左侧服务器列表打开远程文件。</p></div>) : page === 'terminals' ? null : page === 'servers' ? <><header className="workbench-page-heading"><h1>全部服务器</h1><button className="secondary-button" onClick={() => void refreshSnapshots(servers, { force: true })}><RefreshCw size={14} className={refreshing ? 'spin' : ''} />刷新全部</button></header><ServerTable servers={filteredServers} snapshots={snapshots} testingId={testingId} vscodeConnectingId={vscodeConnectingId} accessRouteId={accessRouteIdFor} onAccessRouteChange={selectAccessRoute} onOverview={openServerDetail} onTest={testServer} onTerminal={openServerTerminal} onSftp={openSftp} onVsCode={(server) => void openVsCode(server)} onGpu={(server, gpuIndex) => openGpu(server, gpuIndex)} onEdit={(server) => setDialogServer(server)} onRemove={removeServer} onMerge={mergeServerPath} /></> : page === 'gpus' ? <GpuResourcePool servers={filteredServers} snapshots={snapshots} watches={settings.gpuWatches} refreshing={refreshing} onRefresh={() => void refreshSnapshots(servers, { force: true })} onToggleWatch={(target) => void toggleGpuWatch(target)} onSelect={openGpu} filters={gpuPoolFilters} onFiltersChange={setGpuPoolFilters} /> : page === 'alerts' ? <><header className="workbench-page-heading"><h1>告警</h1><span>{alerts.length} 条活动告警</span></header><AlertsPage alerts={alerts} /></> : <><header className="workbench-page-heading"><h1>设置</h1></header><SettingsPage settings={settings} onChange={setSettings} onSave={saveSettings} /></>}
           </div>
-          <div className="topbar-actions">
-            {(page === 'dashboard' || page === 'servers') && <div className="search-box"><Search size={16} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索服务器、IP 或标签" /></div>}
-            <button
-              type="button"
-              className={`icon-button top title-alert-button ${page === 'alerts' ? 'active' : ''} ${alerts.length ? 'has-alerts' : ''}`}
-              onClick={() => goToPage('alerts')}
-              title={alerts.length ? `告警中心（${alerts.length} 条活动告警）` : '告警中心（当前无活动告警）'}
-              aria-label={alerts.length ? `打开告警中心，当前有 ${alerts.length} 条活动告警` : '打开告警中心，当前无活动告警'}
-            >
-              <Bell size={18} />
-              {alerts.length > 0 && <span aria-hidden="true">{alerts.length > 99 ? '99+' : alerts.length}</span>}
-            </button>
-            {page !== 'terminals' && page !== 'serverDetail' && <button className="icon-button top" onClick={() => void refreshSnapshots(servers, { force: true })} title="手动刷新全部服务器"><RefreshCw size={18} className={refreshing ? 'spin' : ''} /></button>}
-            {(page === 'dashboard' || page === 'servers') && <button className="secondary-button import-button" onClick={() => void importSshConfig()} disabled={importingConfig}><FileDown size={16} />{importingConfig ? '正在读取…' : '导入 SSH Config'}</button>}
-            {page !== 'terminals' && <button className="primary-button" onClick={() => setDialogServer(null)}><Plus size={17} />添加服务器</button>}
-          </div>
-          <div className="window-controls" aria-label="窗口控制">
-            <button onClick={() => window.labApi.windowControls.minimize()} title="最小化" aria-label="最小化"><Minus size={16} /></button>
-            <button onClick={() => void window.labApi.windowControls.toggleMaximize().then(setWindowMaximized)} title={windowMaximized ? '还原窗口' : '最大化'} aria-label={windowMaximized ? '还原窗口' : '最大化'}>{windowMaximized ? <Copy size={13} /> : <Square size={12} />}</button>
-            <button className="window-close" onClick={() => window.labApi.windowControls.close()} title="关闭" aria-label="关闭"><X size={15} /></button>
-          </div>
-        </header>
-
-        <div className={`page-content ${page === 'serverDetail' ? 'server-detail-page-content' : ''} ${page === 'terminals' ? 'ssh-terminal-page' : ''}`}>
-          {loading ? <LoadingState /> : page === 'dashboard' ? (
-            <Dashboard servers={filteredServers} snapshots={snapshots} serverOrder={settings.serverOrder} onReorder={(order) => void saveServerOrder(order)} summary={summary} alerts={alerts} testingId={testingId} vscodeConnectingId={vscodeConnectingId} accessRouteId={accessRouteIdFor} onAccessRouteChange={selectAccessRoute} onOverview={openServerDetail} onTest={testServer} onTerminal={openServerTerminal} onSftp={openSftp} onVsCode={(server) => void openVsCode(server)} onGpu={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} onEdit={(server) => setDialogServer(server)} onRemove={removeServer} onMerge={mergeServerPath} />
-          ) : page === 'gpus' ? (
-            <GpuOverview servers={filteredServers} snapshots={snapshots} watches={settings.gpuWatches} onToggleWatch={(target) => void toggleGpuWatch(target)} onSelect={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} />
-          ) : page === 'tasks' ? (
-            <ExperimentTaskPool
-              tasks={experimentTasks}
-              servers={servers}
-              snapshots={snapshots}
-              liveTasks={<MyTasksPage tasks={myTasks} onOpenGpu={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} />}
-              liveTaskCount={myTasks.length}
-              vscodeConnectingId={vscodeConnectingId}
-              onChanged={updateExperimentTask}
-              notify={notify}
-              confirm={requestConfirmation}
-              onTrusted={async () => { await loadServers() }}
-              onOpenTerminal={openExperimentTerminal}
-              onOpenFiles={openSftp}
-              onOpenVsCode={(server, routeId, path) => void openVsCode(server, routeId, path)}
+          <section className={`workbench-terminal-dock ${showTerminal ? 'expanded' : 'collapsed'} ${page === 'terminals' ? 'fullscreen' : ''}`} aria-label="终端工作区">
+            <header className="workbench-dock-heading"><button onClick={() => { if (page === 'terminals') { setPage('serverDetail'); setTerminalDockOpen(false) } else setTerminalDockOpen((open) => !open) }} aria-expanded={showTerminal}><SquareTerminal size={13} />终端<span>{terminalSessions.length ? `${terminalSessions.length} 个会话` : '未打开会话'}</span>{showTerminal ? <ChevronDown size={13} /> : <ChevronUp size={13} />}</button><div>{page !== 'terminals' && showTerminal && <button onClick={() => goToPage('terminals')} aria-label="全屏终端"><Square size={12} /></button>}<button onClick={addLocalTerminalSession}><Plus size={13} />本地终端</button></div></header>
+            <ServerTerminalWorkspace
+              sessions={terminalSessions} activeId={activeTerminalSessionId} visible={showTerminal} servers={servers} accessRouteIdFor={accessRouteIdFor}
+              onActivate={setActiveTerminalSessionId} onAdd={addTerminalSession} onAddLocal={addLocalTerminalSession} onClose={closeTerminalSession}
+              onOpenVsCode={(server, routeId) => void openVsCode(server, routeId)} vscodeConnectingId={vscodeConnectingId}
+              onOpenFiles={(session) => openSftp(servers.find((server) => server.id === session.server.id) ?? session.server, session.accessRouteId, session.currentPath)}
+              onOpenServerFiles={openSftp} onWorkingDirectory={updateTerminalWorkingDirectory} onTrusted={async () => { await loadServers() }} confirm={requestConfirmation}
             />
-          ) : page === 'servers' ? (
-            <ServerTable servers={filteredServers} snapshots={snapshots} testingId={testingId} vscodeConnectingId={vscodeConnectingId} accessRouteId={accessRouteIdFor} onAccessRouteChange={selectAccessRoute} onOverview={openServerDetail} onTest={testServer} onTerminal={openServerTerminal} onSftp={openSftp} onVsCode={(server) => void openVsCode(server)} onGpu={(server, gpuIndex) => setGpuSelection({ server, gpuIndex })} onEdit={(server) => setDialogServer(server)} onRemove={removeServer} onMerge={mergeServerPath} />
-          ) : page === 'serverDetail' && selectedServer ? (
-            <ServerDetailPage key={selectedServer.id} server={selectedServer} snapshot={snapshots[selectedServer.id]} refreshing={refreshing} accessRouteId={accessRouteIdFor(selectedServer)} onAccessRouteChange={(routeId) => selectAccessRoute(selectedServer, routeId)} vscodeConnecting={vscodeConnectingId === selectedServer.id} onTerminal={() => openServerTerminal(selectedServer)} onRefresh={() => void refreshSnapshots([selectedServer], { force: true })} onSftp={() => openSftp(selectedServer)} onVsCode={() => void openVsCode(selectedServer)} onEdit={() => setDialogServer(selectedServer)} onGpu={(gpuIndex) => setGpuSelection({ server: selectedServer, gpuIndex })} />
-          ) : page === 'terminals' ? null : page === 'alerts' ? (
-            <AlertsPage alerts={alerts} />
-          ) : (
-            <SettingsPage settings={settings} onChange={setSettings} onSave={saveSettings} />
-          )}
-          <ServerTerminalWorkspace
-            sessions={terminalSessions}
-            activeId={activeTerminalSessionId}
-            visible={!loading && page === 'terminals'}
-            servers={servers}
-            accessRouteIdFor={accessRouteIdFor}
-            onActivate={setActiveTerminalSessionId}
-            onAdd={addTerminalSession}
-            onAddLocal={addLocalTerminalSession}
-            onClose={closeTerminalSession}
-            onOpenVsCode={(server, accessRouteId) => void openVsCode(server, accessRouteId)}
-            vscodeConnectingId={vscodeConnectingId}
-            onOpenFiles={(session) => {
-              const server = servers.find((item) => item.id === session.server.id) ?? session.server
-              openSftp(server, session.accessRouteId, session.currentPath)
-            }}
-            onOpenServerFiles={(server, accessRouteId) => openSftp(server, accessRouteId)}
-            onWorkingDirectory={updateTerminalWorkingDirectory}
-            onTrusted={async () => { await loadServers() }}
-            confirm={requestConfirmation}
-          />
-        </div>
-      </main>
+          </section>
+        </main>
+      </div>
+      <footer className="workbench-statusbar"><span><i className={settings.monitoringEnabled ? 'on' : ''} />{settings.monitoringEnabled ? '监控已启用' : '监控已关闭'}<span>{terminalSessions.length} 个终端会话</span></span><span>{refreshing ? '正在采集…' : selectedServer && snapshots[selectedServer.id] ? `最近采集 ${new Date(snapshots[selectedServer.id].sampledAt).toLocaleTimeString('zh-CN')}` : '尚未采集'}<span>间隔 {settings.pollingIntervalSeconds} 秒</span></span></footer>
 
       {dialogServer !== undefined && <ServerDialog server={dialogServer} onClose={() => setDialogServer(undefined)} onSaved={(server) => void saved(server)} />}
-      {gpuSelection && <GpuDetailPanel server={gpuSelection.server} snapshot={snapshots[gpuSelection.server.id]} initialGpuIndex={gpuSelection.gpuIndex} watches={settings.gpuWatches} onToggleWatch={(gpuUuid) => void toggleGpuWatch({ serverId: gpuSelection.server.id, gpuUuid })} onClose={() => setGpuSelection(null)} />}
+
       {closePromptOpen && <ClosePrompt remember={rememberCloseChoice} onRememberChange={setRememberCloseChoice} onChoose={(action) => void resolveCloseAction(action)} />}
       {pendingConfirmation && <ConfirmDialog {...pendingConfirmation} onCancel={() => settleConfirmation(false)} onConfirm={() => settleConfirmation(true)} />}
       <div className="toast-stack">{toasts.map((toast) => <div key={toast.id} className={`toast ${toast.kind}`}>{toast.kind === 'success' ? <CheckCircle2 size={18} /> : <XCircle size={18} />}<span>{toast.message}</span></div>)}</div>
@@ -871,10 +857,11 @@ function NavButton({ active, icon, label, badge, danger, onClick }: { active: bo
   return <button className={`nav-button ${active ? 'active' : ''}`} onClick={onClick}>{icon}<span>{label}</span>{badge !== undefined && <b className={danger ? 'danger' : ''}>{badge}</b>}</button>
 }
 
-function SidebarServerLink({ server, snapshot, active, dragging, dragOver, onClick, onDragStart, onDragEnd, onDragOver, onDrop }: { server: ServerProfile; snapshot?: ServerSnapshot; active: boolean; dragging: boolean; dragOver: boolean; onClick(): void; onDragStart(event: React.DragEvent<HTMLButtonElement>): void; onDragEnd(): void; onDragOver(event: React.DragEvent<HTMLButtonElement>): void; onDrop(event: React.DragEvent<HTMLButtonElement>): void }): React.JSX.Element {
+function SidebarServerLink({ server, accessRouteId, snapshot, active, dragging, dragOver, onClick, onDragStart, onDragEnd, onDragOver, onDrop }: { server: ServerProfile; accessRouteId: string; snapshot?: ServerSnapshot; active: boolean; dragging: boolean; dragOver: boolean; onClick(): void; onDragStart(event: React.DragEvent<HTMLButtonElement>): void; onDragEnd(): void; onDragOver(event: React.DragEvent<HTMLButtonElement>): void; onDrop(event: React.DragEvent<HTMLButtonElement>): void }): React.JSX.Element {
   const visualStatus = snapshot?.cached ? 'cached' : snapshot?.status ?? 'unknown'
-  const busyCount = snapshot?.gpus.filter(isGpuBusy).length ?? 0
-  return <button type="button" draggable className={`sidebar-server-link ${active ? 'active' : ''}${dragging ? ' dragging' : ''}${dragOver ? ' drag-over' : ''}`} onClick={onClick} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragOver={onDragOver} onDrop={onDrop} title={`${server.name} · ${statusLabel(snapshot)} · 拖动可调整顺序`}><i className={visualStatus} /><span>{server.name}</span>{snapshot?.gpus.length ? <b>{busyCount}/{snapshot.gpus.length}</b> : null}<GripVertical className="sidebar-server-drag-icon" size={13} aria-hidden="true" /></button>
+  const route = getAccessRoute(server, accessRouteId)
+  const endpoint = `${route.host.includes(':') && !route.host.startsWith('[') ? `[${route.host}]` : route.host}:${route.port}`
+  return <button type="button" draggable className={`sidebar-server-link ${active ? 'active' : ''}${dragging ? ' dragging' : ''}${dragOver ? ' drag-over' : ''}`} onClick={onClick} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragOver={onDragOver} onDrop={onDrop} title={`${server.name} · ${endpoint} · ${route.name} · ${statusLabel(snapshot)} · 拖动可调整顺序`}><i className={visualStatus} /><span><strong>{server.name}</strong><small>{endpoint}</small></span><GripVertical className="sidebar-server-drag-icon" size={13} aria-hidden="true" /></button>
 }
 
 interface CommonServerActions {
@@ -893,104 +880,16 @@ interface CommonServerActions {
   onMerge(server: ServerProfile): void
 }
 
-function Dashboard({ servers, snapshots, serverOrder, onReorder, summary, alerts, ...actions }: { servers: ServerProfile[]; snapshots: Record<string, ServerSnapshot>; serverOrder: string[]; onReorder(order: string[]): void; summary: { online: number; warning: number; gpuCount: number; averageGpu: number }; alerts: Array<{ server: ServerProfile; level: 'critical' | 'warning'; title: string; detail: string }> } & CommonServerActions): React.JSX.Element {
-  const [draggedServerId, setDraggedServerId] = useState<string | null>(null)
-  const [dragOverServerId, setDragOverServerId] = useState<string | null>(null)
-  const orderedServers = useMemo(() => {
-    const positions = new Map(serverOrder.map((serverId, index) => [serverId, index]))
-    return [...servers].sort((left, right) => (positions.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (positions.get(right.id) ?? Number.MAX_SAFE_INTEGER))
-  }, [servers, serverOrder])
-  const startCardDrag = (event: React.DragEvent<HTMLButtonElement>, server: ServerProfile): void => {
-    event.dataTransfer.effectAllowed = 'move'
-    event.dataTransfer.setData('text/plain', server.id)
-    setDraggedServerId(server.id)
-  }
-  const dropCard = (event: React.DragEvent<HTMLElement>, target: ServerProfile): void => {
-    event.preventDefault()
-    const sourceId = event.dataTransfer.getData('text/plain') || draggedServerId
-    if (sourceId && sourceId !== target.id) {
-      const next = [...orderedServers]
-      const sourceIndex = next.findIndex((server) => server.id === sourceId)
-      const targetIndex = next.findIndex((server) => server.id === target.id)
-      if (sourceIndex >= 0 && targetIndex >= 0) {
-        const [moved] = next.splice(sourceIndex, 1)
-        next.splice(targetIndex, 0, moved)
-        onReorder(next.map((server) => server.id))
-      }
-    }
-    setDraggedServerId(null)
-    setDragOverServerId(null)
-  }
-  return <>
-    <section className="summary-grid">
-      <SummaryCard tone="teal" icon={<ServerIcon size={20} />} label="在线服务器" value={`${summary.online}/${servers.length}`} hint="本地轮询状态" />
-      <SummaryCard tone="blue" icon={<Cpu size={20} />} label="GPU 设备" value={String(summary.gpuCount)} hint={`平均利用率 ${Math.round(summary.averageGpu)}%`} />
-      <SummaryCard tone="amber" icon={<AlertTriangle size={20} />} label="需要关注" value={String(alerts.length)} hint={alerts.length ? `${summary.warning} 台服务器有告警` : '当前无活动告警'} />
-      <SummaryCard tone="violet" icon={<Gauge size={20} />} label="采集模式" value="本地" hint="Agentless · SSH" />
-    </section>
-
-    <section className="section-block">
-      <div className="section-header"><div><h2>服务器状态</h2><p>点击终端或文件按钮开始操作真实服务器 · 拖动卡片左上角可调整顺序</p></div><span className="live-indicator"><i />本地实时采集</span></div>
-      <div className="server-grid">
-        {orderedServers.map((server) => <ServerCard key={server.id} server={server} snapshot={snapshots[server.id]} dragging={draggedServerId === server.id} dragOver={dragOverServerId === server.id} onDragStart={(event) => startCardDrag(event, server)} onDragEnd={() => { setDraggedServerId(null); setDragOverServerId(null) }} onDragOver={(event) => { event.preventDefault(); event.dataTransfer.dropEffect = 'move'; setDragOverServerId(server.id) }} onDrop={(event) => dropCard(event, server)} {...actions} />)}
-        {!servers.length && <EmptyServers />}
-      </div>
-    </section>
-
-    <section className="dashboard-lower">
-      <div className="panel recent-alerts"><div className="panel-title"><div><h3>活动告警</h3><p>磁盘、温度与连接状态</p></div><Bell size={19} /></div>{alerts.length ? alerts.slice(0, 4).map((alert, index) => <div className="alert-row" key={`${alert.server.id}-${index}`}><div className={`alert-icon ${alert.level}`}><AlertTriangle size={16} /></div><div><strong>{alert.title}</strong><span>{alert.server.name} · {alert.detail}</span></div><time>刚刚</time></div>) : <div className="healthy-state"><CheckCircle2 size={30} /><strong>一切正常</strong><span>当前没有需要处理的告警</span></div>}</div>
-    </section>
-  </>
-}
-
-function SummaryCard({ tone, icon, label, value, hint }: { tone: string; icon: React.ReactNode; label: string; value: string; hint: string }): React.JSX.Element {
-  return <div className="summary-card"><div className={`summary-icon ${tone}`}>{icon}</div><div><span>{label}</span><strong>{value}</strong><small>{hint}</small></div></div>
-}
-
-function ServerCard({ server, snapshot, dragging, dragOver, onDragStart, onDragEnd, onDragOver, onDrop, testingId, vscodeConnectingId, accessRouteId, onAccessRouteChange, onOverview, onTest, onTerminal, onSftp, onVsCode, onGpu, onEdit, onRemove, onMerge }: { server: ServerProfile; snapshot?: ServerSnapshot; dragging: boolean; dragOver: boolean; onDragStart(event: React.DragEvent<HTMLButtonElement>): void; onDragEnd(): void; onDragOver(event: React.DragEvent<HTMLElement>): void; onDrop(event: React.DragEvent<HTMLElement>): void } & CommonServerActions): React.JSX.Element {
-  const memoryPercent = snapshot?.memoryTotalBytes && snapshot.memoryUsedBytes ? snapshot.memoryUsedBytes / snapshot.memoryTotalBytes * 100 : null
-  const disk = snapshot?.fileSystems.find((item) => item.mountPoint === '/') ?? snapshot?.fileSystems[0]
-  const gpus = snapshot?.gpus ?? []
-  const busyGpuCount = gpus.filter(isGpuBusy).length
-  const primaryGpu = [...gpus].sort((left, right) => {
-    const processDifference = right.processes.length - left.processes.length
-    return processDifference || right.utilizationPercent - left.utilizationPercent || right.memoryUsedMiB - left.memoryUsedMiB
-  })[0]
-  const peakGpuTemperature = gpus.reduce((maximum, gpu) => Math.max(maximum, gpu.temperatureC), 0)
-  const offline = snapshot?.status === 'offline' && !snapshot.cached
-  const visualStatus = snapshot?.cached ? 'cached' : snapshot?.status ?? 'unknown'
-  const selectedRouteId = accessRouteId(server)
-  const selectedRoute = getAccessRoute(server, selectedRouteId)
-  return <article className={`server-card status-${visualStatus}${dragging ? ' dragging' : ''}${dragOver ? ' drag-over' : ''}`} onDragOver={onDragOver} onDrop={onDrop}>
-    <div className="server-card-head"><div className="server-card-heading"><button type="button" className="server-card-drag-handle" draggable title="拖动调整顺序" aria-label={`拖动调整 ${server.name} 的顺序`} onDragStart={onDragStart} onDragEnd={onDragEnd}><GripVertical size={17} /></button><button type="button" className="server-title server-title-button" onClick={() => onOverview(server)} title="打开服务器总览"><div className="server-symbol"><ServerIcon size={20} /></div><div><div className="name-row"><h3>{server.name}</h3>{server.mode === 'demo' && <span className="demo-chip">演示</span>}</div><p>{selectedRoute.username}@{selectedRoute.host}:{selectedRoute.port}</p></div></button></div><div className={`status-dot ${visualStatus}`} title={statusLabel(snapshot)} /></div>
-    <div className="server-meta"><span className="monitor-policy-chip">采集：{monitorPolicyLabel[server.monitorPolicy]}</span><span>{server.group}</span>{server.tags.map((tag) => <span key={tag}>{tag}</span>)}</div>
-    {offline ? <div className="offline-message"><WifiOff size={18} /><div><strong>暂时无法连接</strong><span>{snapshot.error}</span></div></div> : <div className="metric-list">
-      <MetricRow icon={<Cpu size={15} />} label="CPU" value={formatPercent(snapshot?.cpuUsagePercent)} percent={snapshot?.cpuUsagePercent ?? 0} />
-      <MetricRow icon={<MemoryStick size={15} />} label="内存" value={formatPercent(memoryPercent)} percent={memoryPercent ?? 0} />
-      <MetricRow icon={<HardDrive size={15} />} label="系统盘" value={formatPercent(disk?.usagePercent)} percent={disk?.usagePercent ?? 0} warn={(disk?.usagePercent ?? 0) >= 80} />
-      {primaryGpu && <button className="gpu-metric-button" onClick={() => onGpu(server, primaryGpu.index)} title="查看每块 GPU 和当前进程"><MetricRow icon={<Activity size={15} />} label="GPU" value={`${busyGpuCount}/${gpus.length}`} percent={gpus.length ? busyGpuCount / gpus.length * 100 : 0} warn={peakGpuTemperature >= 80} /></button>}
-    </div>}
-    <div className="server-card-foot"><AccessRouteSelect server={server} value={selectedRouteId} onChange={(routeId) => onAccessRouteChange(server, routeId)} /><div className="card-actions">{isLegacyJumpProfile(server.name) && <button onClick={() => onMerge(server)} title="将此条目的 SSH 路径合并到主服务器"><GitMerge size={15} /></button>}<button onClick={() => onTest(server)} disabled={testingId === server.id} title="测试连接"><RefreshCw size={15} className={testingId === server.id ? 'spin' : ''} /></button><button onClick={() => onSftp(server)} title="独立文件传输窗口"><FolderOpen size={15} /></button><button className="server-vscode-action" onClick={() => onVsCode(server)} disabled={vscodeConnectingId === server.id} title={vscodeConnectingId === server.id ? 'VS Code 连接中' : '独立 VS Code Remote-SSH 窗口'} aria-label={vscodeConnectingId === server.id ? 'VS Code 连接中' : '打开 VS Code'}><Code2 size={15} /></button><button className="terminal-action" onClick={() => onTerminal(server)} title="打开终端" aria-label="打开终端"><SquareTerminal size={15} /></button><button onClick={() => onEdit(server)} title="编辑"><Pencil size={14} /></button><button onClick={() => onRemove(server)} title="删除"><Trash2 size={14} /></button></div></div>
-  </article>
-}
-
-function MetricRow({ icon, label, value, percent, detail, warn }: { icon: React.ReactNode; label: string; value: string; percent: number; detail?: string; warn?: boolean }): React.JSX.Element {
-  const level = warn || percent >= 90 ? 'critical' : percent >= 70 ? 'warning' : percent >= 40 ? 'active' : 'normal'
-  return <div className={`metric-row load-${level}`}><div className="metric-label">{icon}<span>{label}</span></div><div className="metric-track"><i style={{ width: `${Math.max(0, Math.min(100, percent))}%` }} /></div><strong>{value}</strong>{detail && <small>{detail}</small>}</div>
-}
-
 function ServerTable({ servers, snapshots, ...actions }: { servers: ServerProfile[]; snapshots: Record<string, ServerSnapshot> } & CommonServerActions): React.JSX.Element {
-  return <section className="panel server-table-panel"><div className="table-heading"><div><h2>全部服务器</h2><p>{servers.length} 台物理服务器 · 每台可切换连接路径</p></div></div><div className="server-table"><div className="server-table-head"><span>服务器</span><span>状态</span><span>资源摘要</span><span>分组/标签</span><span>操作</span></div>{servers.map((server) => {
+  return <section className="wb-all-servers"><div className="wb-table-scroll"><table className="wb-table wb-all-server-table"><thead><tr><th>服务器</th><th>状态</th><th>CPU / 内存</th><th>GPU 设备</th><th>系统存储</th><th>连接路径</th><th>操作</th></tr></thead><tbody>{servers.map(server => {
     const snapshot = snapshots[server.id]
-    const disk = snapshot?.fileSystems.find((fileSystem) => fileSystem.mountPoint === '/') ?? snapshot?.fileSystems[0]
-    const visualStatus = snapshot?.cached ? 'cached' : snapshot?.status ?? 'unknown'
-    const busyGpus = snapshot?.gpus.filter(isGpuBusy) ?? []
-    const firstGpuIndex = busyGpus[0]?.index ?? snapshot?.gpus[0]?.index
-    const selectedRoute = getAccessRoute(server, actions.accessRouteId(server))
-    return <div className="server-table-row" key={server.id}><button type="button" className="table-server table-server-button" onClick={() => actions.onOverview(server)}><div className="server-symbol small"><ServerIcon size={17} /></div><div><strong>{server.name}</strong><span>{selectedRoute.host}:{selectedRoute.port} · {selectedRoute.username}</span></div></button><div><span className={`table-status ${visualStatus}`}><i />{statusLabel(snapshot)}</span><small className="table-policy">{monitorPolicyLabel[server.monitorPolicy]}采集</small></div><div className="resource-summary"><span><Cpu size={14} />{formatPercent(snapshot?.cpuUsagePercent)}</span><span><MemoryStick size={14} />{snapshot?.memoryUsedBytes ? formatBytes(snapshot.memoryUsedBytes) : '—'}</span><span><HardDrive size={14} />{formatPercent(disk?.usagePercent)}</span>{snapshot?.gpus.length && firstGpuIndex !== undefined ? <button onClick={() => actions.onGpu(server, firstGpuIndex)}><Activity size={14} />{busyGpus.length}/{snapshot.gpus.length} 忙碌</button> : null}</div><div className="table-tags"><b>{server.group}</b>{server.tags.slice(0, 2).map((tag) => <span key={tag}>{tag}</span>)}</div><div className="table-actions"><AccessRouteSelect server={server} value={actions.accessRouteId(server)} compact onChange={(routeId) => actions.onAccessRouteChange(server, routeId)} />{isLegacyJumpProfile(server.name) && <button className="icon-button small" onClick={() => actions.onMerge(server)} title="将此条目的 SSH 路径合并到主服务器"><GitMerge size={15} /></button>}<button className="icon-button small" onClick={() => actions.onTest(server)}><RefreshCw size={15} className={actions.testingId === server.id ? 'spin' : ''} /></button><button className="icon-button small" onClick={() => actions.onSftp(server)} title="独立文件传输窗口"><FolderOpen size={15} /></button><button className="icon-button small server-vscode-icon" onClick={() => actions.onVsCode(server)} disabled={actions.vscodeConnectingId === server.id} title="独立 VS Code Remote-SSH 窗口"><Code2 size={15} /></button><button className="table-terminal" onClick={() => actions.onTerminal(server)}><SquareTerminal size={15} />终端</button><button className="icon-button small" onClick={() => actions.onEdit(server)}><Pencil size={14} /></button><button className="icon-button small danger-hover" onClick={() => actions.onRemove(server)}><Trash2 size={14} /></button></div></div>
-  })}</div></section>
+    const disk = snapshot?.fileSystems.find(item => item.mountPoint === '/') ?? snapshot?.fileSystems[0]
+    const route = getAccessRoute(server, actions.accessRouteId(server))
+    const live = !!snapshot && !snapshot.cached && (snapshot.status === 'online' || snapshot.status === 'warning')
+    const state = snapshot?.cached ? 'cached' : snapshot?.status ?? 'unknown'
+    return <tr key={server.id}><td><button className="wb-device-link" onClick={() => actions.onOverview(server)}><strong>{server.name}</strong><small>{route.username}@{route.host}:{route.port}</small></button><small className="wb-cell-secondary">{server.group || '未分组'}{server.tags.length ? ` · ${server.tags.join(' / ')}` : ''}</small></td><td><span className={`wb-state ${state}`}><i />{statusLabel(snapshot)}</span><small className="wb-cell-secondary">{monitorPolicyLabel[server.monitorPolicy]}采集</small></td><td><span>CPU {formatPercent(snapshot?.cpuUsagePercent)}</span><small className="wb-cell-secondary">{snapshot?.memoryUsedBytes == null ? '—' : formatBytes(snapshot.memoryUsedBytes)} / {snapshot?.memoryTotalBytes == null ? '—' : formatBytes(snapshot.memoryTotalBytes)}</small></td><td><div className="wb-server-gpu-links">{snapshot?.gpus.map(gpu => <button key={gpu.uuid} className={!live ? 'cached' : isGpuBusy(gpu) ? 'busy' : 'idle'} title={`${gpu.name} · ${(gpu.memoryUsedMiB / 1024).toFixed(1)} / ${(gpu.memoryTotalMiB / 1024).toFixed(0)} GiB`} aria-label={`查看 ${server.name} GPU ${gpu.index} 详情`} onClick={() => actions.onGpu(server, gpu.index)}><i />GPU {gpu.index}<small>{live ? `${Math.round(gpu.utilizationPercent)}%` : '待确认'}</small></button>) ?? null}{!snapshot?.gpus.length && <span className="wb-muted">{snapshot ? '无 GPU' : '尚未采集'}</span>}</div></td><td><span className={disk && disk.usagePercent >= 80 ? 'wb-warning' : ''}>{formatPercent(disk?.usagePercent)}</span><small className="wb-cell-secondary">{disk ? `${disk.mountPoint} · 可用 ${formatBytes(disk.availableBytes)}` : '—'}</small></td><td>{getAccessRoutes(server).length > 1 ? <AccessRouteSelect server={server} value={actions.accessRouteId(server)} compact onChange={id => actions.onAccessRouteChange(server, id)} /> : <span className="wb-muted">{route.name}</span>}</td><td><div className="wb-server-actions"><button className="secondary-button" onClick={() => actions.onTerminal(server)}><SquareTerminal size={13} />终端</button><button className="icon-button small" onClick={() => actions.onSftp(server)} aria-label={`打开 ${server.name} 文件`} title="打开文件"><FolderOpen size={14} /></button><button className="icon-button small" onClick={() => actions.onVsCode(server)} disabled={actions.vscodeConnectingId === server.id} aria-label={`打开 ${server.name} VS Code`} title="打开 VS Code"><Code2 size={14} /></button><button className="icon-button small" onClick={() => actions.onTest(server)} disabled={actions.testingId === server.id} aria-label={`测试 ${server.name} 连接`} title="测试连接"><RefreshCw size={14} className={actions.testingId === server.id ? 'spin' : ''} /></button><button className="icon-button small" onClick={() => actions.onEdit(server)} aria-label={`编辑 ${server.name}`} title="编辑服务器"><Pencil size={14} /></button>{isLegacyJumpProfile(server.name) && <button className="icon-button small" onClick={() => actions.onMerge(server)} title="合并连接路径"><GitMerge size={14} /></button>}<button className="icon-button small wb-danger" onClick={() => actions.onRemove(server)} aria-label={`删除 ${server.name}`} title="删除服务器"><Trash2 size={14} /></button></div></td></tr>
+  })}</tbody></table>{!servers.length && <div className="wb-empty-inline">没有匹配的服务器。调整搜索，或从左侧添加服务器。</div>}</div></section>
 }
-
 function MyTasksPage({ tasks, onOpenGpu }: { tasks: UserGpuTask[]; onOpenGpu(server: ServerProfile, gpuIndex: number): void }): React.JSX.Element {
   const serverCount = new Set(tasks.map((task) => task.server.id)).size
   const gpuCount = new Set(tasks.map((task) => `${task.server.id}:${task.gpuIndex}`)).size
@@ -1016,86 +915,6 @@ function MyTasksPage({ tasks, onOpenGpu }: { tasks: UserGpuTask[]; onOpenGpu(ser
       </div> : <div className="my-task-empty"><ListTodo size={38} /><strong>当前没有检测到你的 GPU 任务</strong><span>任务按各服务器配置的 SSH 用户名识别；点击顶部刷新可立即重新采集。</span></div>}
     </div>
   </section>
-}
-
-function GpuOverview({ servers, snapshots, watches, onToggleWatch, onSelect }: { servers: ServerProfile[]; snapshots: Record<string, ServerSnapshot>; watches: GpuWatchTarget[]; onToggleWatch(target: GpuWatchTarget): void; onSelect(server: ServerProfile, gpuIndex: number): void }): React.JSX.Element {
-  const devices = servers.flatMap((server) => {
-    const snapshot = snapshots[server.id]
-    return (snapshot?.gpus ?? []).map((gpu) => ({ server, gpu, cached: Boolean(snapshot?.cached) }))
-  })
-  const [statusFilter, setStatusFilter] = useState('all')
-  const [modelFilter, setModelFilter] = useState('all')
-  const [serverFilter, setServerFilter] = useState('all')
-  const liveDevices = devices.filter(({ cached }) => !cached)
-  const idleCount = liveDevices.filter(({ gpu }) => gpuLoadState(gpu) === 'idle').length
-  const busyCount = liveDevices.filter(({ gpu }) => isGpuBusy(gpu)).length
-  const totalMemory = devices.reduce((sum, { gpu }) => sum + gpu.memoryTotalMiB, 0)
-  const usedMemory = devices.reduce((sum, { gpu }) => sum + gpu.memoryUsedMiB, 0)
-  const models = [...new Set(devices.map(({ gpu }) => gpu.name))].sort()
-  const deviceServers = [...new Map(devices.map(({ server }) => [server.id, server])).values()]
-  const recommendations = liveDevices
-    .map((item) => ({ ...item, recommendation: gpuRecommendation(item.gpu) }))
-    .sort((left, right) => right.recommendation.score - left.recommendation.score)
-    .slice(0, 3)
-  const filtered = devices.filter(({ server, gpu }) => {
-    const state = gpuLoadState(gpu)
-    const statusMatches = statusFilter === 'all' || (statusFilter === 'busy' ? isGpuBusy(gpu) : state === statusFilter)
-    return statusMatches &&
-      (modelFilter === 'all' || gpu.name === modelFilter) &&
-      (serverFilter === 'all' || server.id === serverFilter)
-  })
-  const resetFilters = (): void => {
-    setStatusFilter('all')
-    setModelFilter('all')
-    setServerFilter('all')
-  }
-  const selectedFilterServer = deviceServers.find((server) => server.id === serverFilter)
-  const selectedServerWatched = selectedFilterServer
-    ? watches.some((watch) => watch.serverId === selectedFilterServer.id && !watch.gpuUuid)
-    : false
-  return <>
-    <section className="gpu-pool-summary">
-      <div><Activity size={20} /><span>GPU 总数</span><strong>{devices.length}</strong></div>
-      <div className="idle"><CheckCircle2 size={20} /><span>空闲</span><strong>{idleCount}</strong></div>
-      <div className="busy"><Gauge size={20} /><span>使用中</span><strong>{busyCount}</strong></div>
-      <div><MemoryStick size={20} /><span>显存使用</span><strong>{totalMemory ? `${Math.round(usedMemory / totalMemory * 100)}%` : '—'}</strong></div>
-    </section>
-    <section className="gpu-recommendation-strip">
-      <div className="gpu-recommendation-intro"><Zap size={19} /><div><h2>推荐可用 GPU</h2><p>综合显存余量、利用率、温度和进程数量排序</p></div></div>
-      {recommendations.length ? <div className="gpu-recommendation-list">{recommendations.map(({ server, gpu, recommendation }, index) => <button type="button" key={`${server.id}-${gpu.uuid}`} onClick={() => onSelect(server, gpu.index)}>
-        <span>{index + 1}</span>
-        <div><strong>{server.name} · GPU {gpu.index} · {gpu.name.replace('NVIDIA ', '')}</strong><small>{(recommendation.freeMemoryMiB / 1024).toFixed(1)} GB 空闲 · {Math.round(gpu.utilizationPercent)}% 利用率 · {gpu.processes.length} 个进程 · {Math.round(gpu.temperatureC)}°C</small></div>
-        <b className={recommendation.score >= 75 ? 'recommended' : recommendation.score >= 50 ? 'available' : 'loaded'}>{recommendation.label}<em>{recommendation.score}</em></b>
-      </button>)}</div> : <div className="gpu-recommendation-empty">等待实时 GPU 数据</div>}
-    </section>
-    <section className="section-block">
-      <div className="section-header"><div><h2>GPU 资源池</h2><p>点击任意显卡查看运行用户、进程和历史曲线</p></div><span className="result-count">{filtered.length} / {devices.length} 张</span></div>
-      <div className="gpu-filter-bar">
-        <label><span>状态</span><select value={statusFilter} onChange={(event) => setStatusFilter(event.target.value)}><option value="all">全部</option><option value="idle">空闲</option><option value="busy">使用中</option><option value="warning">温度告警</option></select></label>
-        <label><span>型号</span><select value={modelFilter} onChange={(event) => setModelFilter(event.target.value)}><option value="all">全部型号</option>{models.map((model) => <option key={model} value={model}>{model.replace('NVIDIA ', '')}</option>)}</select></label>
-        <label><span>服务器</span><select value={serverFilter} onChange={(event) => setServerFilter(event.target.value)}><option value="all">全部服务器</option>{deviceServers.map((server) => <option key={server.id} value={server.id}>{server.name}</option>)}</select></label>
-        <button type="button" className={`gpu-server-watch ${selectedServerWatched ? 'active' : ''}`} disabled={!selectedFilterServer} onClick={() => selectedFilterServer && onToggleWatch({ serverId: selectedFilterServer.id })} title={selectedFilterServer ? (selectedServerWatched ? '取消关注这台服务器' : '任意 GPU 空闲时通知我') : '先选择一台服务器'}><Bell size={14} />{selectedServerWatched ? '已关注服务器' : '关注服务器'}</button>
-        <button onClick={resetFilters}>重置</button>
-      </div>
-      {filtered.length ? <div className="gpu-overview-grid">{filtered.map(({ server, gpu, cached }) => {
-        const state = gpuLoadState(gpu)
-        const memoryPercent = gpuMemoryPercent(gpu)
-        const users = [...new Set(gpu.processes.map((process) => process.username))]
-        const utilizationLevel = gpu.utilizationPercent >= 90 ? 'critical' : gpu.utilizationPercent >= 70 ? 'warning' : gpu.utilizationPercent >= 40 ? 'active' : 'normal'
-        const memoryLevel = memoryPercent >= 90 ? 'critical' : memoryPercent >= 70 ? 'warning' : memoryPercent >= 40 ? 'active' : 'normal'
-        const watched = watches.some((watch) => watch.serverId === server.id && (!watch.gpuUuid || watch.gpuUuid === gpu.uuid))
-        return <div role="button" tabIndex={0} className={`gpu-overview-card state-${cached ? 'cached' : state}`} key={`${server.id}-${gpu.uuid}`} onClick={() => onSelect(server, gpu.index)} onKeyDown={(event) => { if (event.target === event.currentTarget && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onSelect(server, gpu.index) } }}>
-          <div className="gpu-overview-head"><div className="gpu-chip"><Cpu size={19} /></div><div><span>{server.name}</span><strong>GPU {gpu.index} · {gpu.name.replace('NVIDIA ', '')}</strong></div><i className={cached ? 'cached' : state}>{cached ? '缓存' : state === 'warning' ? '温度告警' : state === 'idle' ? '空闲' : '使用中'}</i></div>
-          <div className="gpu-overview-metrics"><div><span>利用率</span><strong>{Math.round(gpu.utilizationPercent)}%</strong></div><div><span>显存</span><strong>{(gpu.memoryUsedMiB / 1024).toFixed(1)} / {(gpu.memoryTotalMiB / 1024).toFixed(0)}G</strong></div><div><span>温度</span><strong>{Math.round(gpu.temperatureC)}°C</strong></div><div><span>功耗</span><strong>{gpu.powerW === null ? '—' : `${Math.round(gpu.powerW)}W`}</strong></div></div>
-          <div className="gpu-overview-bars" aria-label="GPU 负载摘要">
-            <div className="gpu-overview-bar"><span>GPU 利用率</span><div className={`gpu-overview-track load-${utilizationLevel}`}><i style={{ width: `${Math.min(100, Math.max(0, gpu.utilizationPercent))}%` }} /></div><strong>{Math.round(gpu.utilizationPercent)}%</strong></div>
-            <div className="gpu-overview-bar"><span>显存占用</span><div className={`gpu-overview-track load-${memoryLevel}`}><i style={{ width: `${Math.min(100, Math.max(0, memoryPercent))}%` }} /></div><strong>{Math.round(memoryPercent)}%</strong></div>
-          </div>
-          <div className="gpu-overview-foot"><span><CircleUserRound size={15} />{users.length ? users.join('、') : '暂无运行用户'}</span><b>{watched && <Bell size={13} />}{gpu.processes.length} 个进程 <ChevronRight size={15} /></b></div>
-        </div>
-      })}</div> : <div className="gpu-empty-page"><Cpu size={40} /><strong>{devices.length ? '没有符合筛选条件的 GPU' : '尚未检测到 GPU'}</strong><span>{devices.length ? '调整筛选条件或重置筛选。' : '刷新监控或检查服务器上的 NVIDIA 驱动。'}</span>{devices.length ? <button onClick={resetFilters}>重置筛选</button> : null}</div>}
-    </section>
-  </>
 }
 
 function AlertsPage({ alerts }: { alerts: Array<{ server: ServerProfile; level: 'critical' | 'warning'; title: string; detail: string }> }): React.JSX.Element {
@@ -1136,9 +955,9 @@ function SettingsPage({ settings, onChange, onSave }: { settings: AppSettings; o
     <section className="panel appearance-panel">
       <div className="panel-title"><div><h3>界面主题</h3><p>选择适合当前环境的控制台外观，切换会立即预览</p></div><LayoutDashboard size={19} /></div>
       <div className="theme-options">
-        <ThemeOption name="深海蓝灰" description="低干扰，适合日常运维" value="ocean" selected={settings.theme === 'ocean'} onSelect={() => onChange({ ...settings, theme: 'ocean' })} />
+        <ThemeOption name="石墨灰" description="中性色工作台，适合日常运维" value="ocean" selected={settings.theme === 'ocean'} onSelect={() => onChange({ ...settings, theme: 'ocean' })} />
         <ThemeOption name="浅色仪器台" description="明亮环境与投影展示" value="instrument" selected={settings.theme === 'instrument'} onSelect={() => onChange({ ...settings, theme: 'instrument' })} />
-        <ThemeOption name="深色机房" description="高对比，适合暗光值守" value="machineRoom" selected={settings.theme === 'machineRoom'} onSelect={() => onChange({ ...settings, theme: 'machineRoom' })} />
+        <ThemeOption name="深色高对比" description="适合暗光环境" value="machineRoom" selected={settings.theme === 'machineRoom'} onSelect={() => onChange({ ...settings, theme: 'machineRoom' })} />
       </div>
     </section>
     <div className="settings-layout"><section className="panel settings-panel"><div className="panel-title"><div><h3>监控设置</h3><p>控制持续监控服务器的轮询频率与并发连接</p></div><Gauge size={19} /></div><SettingToggle label="启用后台监控" description="仅定时采集标记为“持续监控”的服务器" checked={settings.monitoringEnabled} onChange={(value) => onChange({ ...settings, monitoringEnabled: value })} /><SettingToggle label="告警系统通知" description="发现离线、磁盘或温度异常时通知" checked={settings.notifyOnWarning} onChange={(value) => onChange({ ...settings, notifyOnWarning: value })} /><label className="settings-field"><div><strong>关闭窗口时</strong><span>退出会关闭 SSH，前台命令可能中断</span></div><select value={settings.closeBehavior} onChange={(event) => onChange({ ...settings, closeBehavior: event.target.value as AppSettings['closeBehavior'] })}><option value="ask">每次询问</option><option value="tray">总是留在系统托盘</option><option value="exit">直接退出应用</option></select></label><label className="settings-field"><div><strong>轮询间隔</strong><span>较短间隔更新更及时；若上一轮未完成，不会重叠启动采集</span></div><select value={settings.pollingIntervalSeconds} onChange={(event) => onChange({ ...settings, pollingIntervalSeconds: Number(event.target.value) })}><option value={10}>10 秒</option><option value={15}>15 秒</option><option value={30}>30 秒</option><option value={60}>60 秒</option><option value={120}>2 分钟</option><option value={300}>5 分钟</option></select></label><label className="settings-field"><div><strong>最大并发采集</strong><span>服务器较多时限制同时建立的 SSH 连接数</span></div><select value={settings.maxConcurrentPolls} onChange={(event) => onChange({ ...settings, maxConcurrentPolls: Number(event.target.value) })}><option value={3}>3 个</option><option value={5}>5 个</option><option value={10}>10 个</option></select></label><div className="settings-footer"><button className="primary-button" onClick={onSave}>保存设置</button></div></section><section className="panel security-panel"><div className="panel-title"><div><h3>安全状态</h3><p>当前应用的安全保护</p></div><ShieldCheck size={19} /></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>进程隔离已启用</strong><span>Renderer 无法直接访问 Node.js</span></div></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>凭据加密存储</strong><span>由当前 Windows 用户的 DPAPI 保护</span></div></div><div className="security-check"><CheckCircle2 size={17} /><div><strong>主机指纹校验</strong><span>首次连接确认，变化时拒绝连接</span></div></div><div className="settings-warning"><AlertTriangle size={17} /><p>退出托盘程序或电脑进入睡眠后，本地监控和告警会停止。</p></div></section></div>
@@ -1154,4 +973,3 @@ function SettingToggle({ label, description, checked, onChange }: { label: strin
 }
 
 function LoadingState(): React.JSX.Element { return <div className="loading-state"><Activity size={28} className="pulse" /><strong>正在加载本地工作区</strong><span>准备服务器配置与监控数据…</span></div> }
-function EmptyServers(): React.JSX.Element { return <div className="empty-servers"><ServerIcon size={34} /><strong>还没有服务器</strong><span>点击右上角“添加服务器”开始</span></div> }

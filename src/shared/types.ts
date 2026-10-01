@@ -416,7 +416,7 @@ export interface AppApi {
     startRun(taskId: string, input: ExperimentRunStartInput): Promise<ExperimentTask>
     cancelQueuedRun(taskId: string, runId: string): Promise<ExperimentTask>
     cancelRun(taskId: string, runId: string): Promise<ExperimentTask>
-    deleteQueuedRun(taskId: string, runId: string): Promise<ExperimentTask>
+    deleteQueuedRun(taskId: string, runId: string): Promise<ExperimentTask | null>
     deleteTask(taskId: string): Promise<void>
     finishRun(taskId: string, runId: string, input: ExperimentRunFinishInput): Promise<ExperimentTask>
     onChanged(listener: () => void): () => void

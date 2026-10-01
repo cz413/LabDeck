@@ -575,6 +575,7 @@ export class AppStore {
         launchCommand: input.launchCommand,
         condaEnvironment: input.condaEnvironment ? structuredClone(input.condaEnvironment) : undefined,
         minimumFreeVramGiB: input.minimumFreeVramGiB,
+        maximumGpuUtilizationPercent: input.maximumGpuUtilizationPercent,
         artifactPath: input.artifactPath,
         notes: input.notes
       }
@@ -593,6 +594,18 @@ export class AppStore {
     else data.experimentTasks.unshift(task)
     await this.persist()
     return structuredClone(task)
+  }
+
+  async deleteExperimentTask(taskId: string): Promise<void> {
+    const data = this.ensureData()
+    const index = data.experimentTasks.findIndex((task) => task.id === taskId)
+    if (index < 0) throw new Error('实验任务不存在或已被删除')
+    const task = data.experimentTasks[index]
+    if (['preparing', 'running'].includes(task.status) || task.runs.some((run) => run.status === 'preparing' || run.status === 'running')) {
+      throw new Error('任务正在准备或运行，请先取消运行再删除')
+    }
+    data.experimentTasks.splice(index, 1)
+    await this.persist()
   }
 
   async setExperimentTaskStatus(taskId: string, status: ExperimentTaskStatus): Promise<ExperimentTask> {
@@ -637,6 +650,7 @@ export class AppStore {
       if (path && (!path.startsWith('/') || path.includes('\0'))) throw new Error(`${label}必须填写服务器上的绝对路径`)
     }
     if (!input.serverId || !input.accessRouteId) throw new Error('开始记录前，请为本次运行选择服务器和连接路径')
+    if (Boolean(input.gpuUuid) !== (input.gpuIndex !== null)) throw new Error('手动指定 GPU 时，GPU UUID 和编号必须同时提供')
     if (!task.serverId || input.serverId !== task.serverId) throw new Error('任务必须在其指定服务器内调度，请先编辑任务的目标服务器')
     const server = data.servers.find((item) => item.id === input.serverId)
     if (!server) throw new Error('本次运行所选服务器不存在或已被删除')
@@ -658,16 +672,17 @@ export class AppStore {
       serverId: input.serverId,
       serverNameSnapshot: server?.name,
       accessRouteId: input.accessRouteId,
-      gpuUuid: undefined,
-      gpuIndex: undefined,
-      gpuNameSnapshot: undefined,
+      gpuUuid: input.gpuUuid ?? undefined,
+      gpuIndex: input.gpuIndex ?? undefined,
+      gpuNameSnapshot: input.gpuNameSnapshot ?? undefined,
       codePath: input.codePath,
       dataPath: input.dataPath,
       launchCommand: input.launchCommand,
       condaEnvironment: input.condaEnvironment ? structuredClone(input.condaEnvironment) : undefined,
       minimumFreeVramGiB: input.minimumFreeVramGiB,
+      maximumGpuUtilizationPercent: input.maximumGpuUtilizationPercent,
       artifactPath: input.artifactPath,
-      message: '正在等待指定服务器上的空闲 GPU',
+      message: input.gpuUuid || input.gpuIndex !== null ? `等待在指定 GPU ${input.gpuIndex ?? ''} 上立即启动` : '正在等待符合显存和利用率条件的 GPU',
       resultSummary: '',
       notes: input.notes
     }
@@ -681,7 +696,7 @@ export class AppStore {
   async updateExperimentRunState(
     taskId: string,
     runId: string,
-    patch: Partial<Pick<ExperimentRun, 'status' | 'queuedAt' | 'startedAt' | 'finishedAt' | 'message' | 'gpuUuid' | 'gpuIndex' | 'gpuNameSnapshot' | 'minimumFreeVramGiB' | 'remotePid' | 'remoteRunDir' | 'logPath' | 'condaEnvironment'>>,
+    patch: Partial<Pick<ExperimentRun, 'status' | 'queuedAt' | 'startedAt' | 'finishedAt' | 'message' | 'gpuUuid' | 'gpuIndex' | 'gpuNameSnapshot' | 'minimumFreeVramGiB' | 'maximumGpuUtilizationPercent' | 'remotePid' | 'remoteRunDir' | 'logPath' | 'condaEnvironment'>>,
     expectedStatus?: ExperimentRun['status']
   ): Promise<ExperimentTask> {
     const data = this.ensureData()
@@ -714,8 +729,32 @@ export class AppStore {
     })
   }
 
+  async deleteQueuedExperimentRun(taskId: string, runId: string): Promise<ExperimentTask | null> {
+    const data = this.ensureData()
+    const taskIndex = data.experimentTasks.findIndex((item) => item.id === taskId)
+    const task = taskIndex >= 0 ? data.experimentTasks[taskIndex] : undefined
+    if (!task) throw new Error('实验任务不存在或已被删除')
+    const runIndex = task.runs.findIndex((item) => item.id === runId)
+    const run = runIndex >= 0 ? task.runs[runIndex] : undefined
+    if (!run) throw new Error('实验运行记录不存在')
+    if (run.status !== 'queued') throw new Error('只有尚未开始准备的排队记录可以删除')
+    if (task.runs.length === 1) {
+      data.experimentTasks.splice(taskIndex, 1)
+      await this.persist()
+      return null
+    }
+    task.runs.splice(runIndex, 1)
+    const latestRun = task.runs.at(-1)
+    const hasActiveRun = task.runs.some((item) => item.status === 'queued' || item.status === 'preparing' || item.status === 'running')
+    if (!hasActiveRun) task.status = latestRun?.status ?? 'planned'
+    task.updatedAt = now()
+    await this.persist()
+    return structuredClone(task)
+  }
+
   async finishExperimentRun(taskId: string, runId: string, input: ExperimentRunFinishInput): Promise<ExperimentTask> {
     input = experimentRunFinishInputSchema.parse(input)
+    if (input.status === 'cancelled') throw new Error('取消运行会终止远程进程，请使用“取消运行”操作')
     const data = this.ensureData()
     const index = data.experimentTasks.findIndex((task) => task.id === taskId)
     if (index < 0) throw new Error('实验任务不存在或已被删除')

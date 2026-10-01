@@ -133,10 +133,10 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
       lineHeight: 1.25,
       scrollback: 8000,
       theme: {
-        background: '#07101d',
-        foreground: '#d8e4f2',
-        cursor: '#64d8cb',
-        selectionBackground: '#1f6070aa',
+        background: '#191b1d',
+        foreground: '#e2e5e8',
+        cursor: '#a7bed2',
+        selectionBackground: '#536a80aa',
         black: '#0b1524',
         red: '#ff6b7d',
         green: '#67d391',
@@ -203,7 +203,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
       const lastLine = outputTailRef.current.split(/[\r\n]/).at(-1)?.trimEnd() ?? ''
       if (!/[$#>%❯➜›]\s*$/.test(lastLine)) return
       launchCommandSentRef.current = true
-      terminal.write(`\r\n\x1b[38;5;45m正在发送终端快捷命令…\x1b[0m\r\n`)
+      terminal.write(`\r\n\x1b[38;5;110m正在发送终端快捷命令…\x1b[0m\r\n`)
       window.labApi.terminal.write(sessionId, `${command}\r`)
     }
     const clearPasswordPrompt = (): void => {
@@ -352,9 +352,9 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
   const connectTerminal = async (terminal: Terminal): Promise<void> => {
     setStatus('connecting')
     if (isLocal) {
-      terminal.write('\x1b[38;5;45m正在启动本地 PowerShell…\x1b[0m\r\n')
+      terminal.write('\x1b[38;5;110m正在启动本地 PowerShell…\x1b[0m\r\n')
     } else {
-      terminal.write(`\x1b[38;5;45m正在连接 ${route!.username}@${route!.host}:${route!.port}（${route!.name}）…\x1b[0m\r\n`)
+      terminal.write(`\x1b[38;5;110m正在连接 ${route!.username}@${route!.host}:${route!.port}（${route!.name}）…\x1b[0m\r\n`)
     }
     let result = isLocal
       ? await window.labApi.terminal.connectLocal(terminal.cols, terminal.rows)

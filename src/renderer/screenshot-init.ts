@@ -6,19 +6,19 @@ const tib = 1024 ** 4
 
 const servers = [
   {
-    id: 'demo-gpu-01', name: 'GPU-01 · 演示节点', host: '192.0.2.11', port: 22,
+    id: 'demo-gpu-01', name: 'gpu8', host: '192.0.2.11', port: 22,
     username: 'researcher', authType: 'privateKey', tags: ['GPU', '训练'], group: '深度学习集群',
-    mode: 'demo', monitorPolicy: 'background', hasSecret: false, createdAt: iso(2000), updatedAt: iso(1)
+    mode: 'real', monitorPolicy: 'background', hasSecret: true, createdAt: iso(2000), updatedAt: iso(1)
   },
   {
-    id: 'demo-gpu-02', name: 'GPU-02 · 演示节点', host: '192.0.2.12', port: 22,
+    id: 'demo-gpu-02', name: 'gpu7', host: '192.0.2.12', port: 22,
     username: 'researcher', authType: 'privateKey', tags: ['GPU', '推理'], group: '深度学习集群',
-    mode: 'demo', monitorPolicy: 'background', hasSecret: false, createdAt: iso(1800), updatedAt: iso(2)
+    mode: 'real', monitorPolicy: 'background', hasSecret: true, createdAt: iso(1800), updatedAt: iso(2)
   },
   {
     id: 'demo-storage-01', name: 'Storage-01 · 演示节点', host: '192.0.2.13', port: 22,
     username: 'lab', authType: 'password', tags: ['存储'], group: '基础设施',
-    mode: 'demo', monitorPolicy: 'background', hasSecret: false, createdAt: iso(1600), updatedAt: iso(3)
+    mode: 'real', monitorPolicy: 'background', hasSecret: true, createdAt: iso(1600), updatedAt: iso(3)
   }
 ]
 
@@ -82,6 +82,24 @@ const historyFor = (gpuIndex: number) => Array.from({ length: 36 }, (_, index) =
 })
 
 const noEvents = (): (() => void) => () => undefined
+const taskBase = { project: '视觉语言模型', objective: '', tags: [], priority: 'normal',
+  serverId: servers[0].id, accessRouteId: 'default', codePath: '/home/researcher/code/LISA',
+  dataPath: '/data/datasets', launchCommand: 'python train.py --batch-size 4',
+  artifactPath: '', resultSummary: '', notes: '', archived: false, createdAt: iso(120), updatedAt: iso(2) }
+let tasks = ['running', 'queued', 'cancelled', 'failed'].map((status, index) => ({ ...taskBase,
+  id: status, title: ['LISA 复现', '视觉指令微调', 'LISA 复现 · 已取消', '分割模型消融'][index], status,
+  runs: [{ ...taskBase, id: `${status}-run`, number: 1, status, queuedAt: iso(90),
+    startedAt: status === 'running' ? iso(80) : undefined, gpuIndex: status === 'running' ? 0 : undefined }]
+}))
+const preview = { terminalConnects: 0, terminalCloses: 0, startedRuns: [] as unknown[], sftpReads: [] as unknown[], offlineServers: [] as string[], cachedServers: [] as string[] }
+Object.assign(window, { __labPreview: preview })
+const taskListeners = new Set<() => void>()
+const dataListeners = new Set<(event: { sessionId: string; data: string }) => void>()
+const connect = async () => {
+  const sessionId = `preview-${++preview.terminalConnects}`
+  setTimeout(() => dataListeners.forEach((listener) => listener({ sessionId, data: '\r\nresearcher@gpu8:~$ ' })), 120)
+  return { status: 'connected', sessionId }
+}
 const api = {
   windowControls: {
     minimize: () => undefined,
@@ -99,23 +117,49 @@ const api = {
   },
   sshConfig: { importAll: async () => ({ imported: [], skipped: [], configPath: '' }) },
   monitor: {
-    snapshot: async (id: string) => structuredClone(snapshots[id as keyof typeof snapshots]),
-    cachedSnapshots: async () => ({}),
+    snapshot: async (id: string) => ({ ...structuredClone(snapshots[id as keyof typeof snapshots]),
+      ...(preview.offlineServers.includes(id) ? { status: 'offline', error: '模拟连接失败' } : {}),
+      ...(preview.cachedServers.includes(id) ? { cached: true } : {}) }),
+    cachedSnapshots: async () => structuredClone(snapshots),
     gpuHistory: async (_serverId: string, gpuUuid: string) => historyFor(Number(gpuUuid.split('-').at(-1) ?? 0))
   },
   terminal: {
-    connect: async () => ({ status: 'failed', message: '截图模式不建立 SSH 连接' }),
-    connectLocal: async () => ({ status: 'failed', message: '截图模式不建立终端连接' }),
-    write: () => undefined, autofillPassword: async () => false, resize: () => undefined, close: () => undefined,
-    onData: noEvents, onExit: noEvents
+    connect, connectLocal: connect,
+    write: () => undefined, autofillPassword: async () => false, resize: () => undefined,
+    close: () => { preview.terminalCloses++ },
+    onData: (listener: (event: { sessionId: string; data: string }) => void) => { dataListeners.add(listener); return () => { dataListeners.delete(listener) } }, onExit: noEvents
   },
   sftp: {
-    openWindow: async () => undefined, list: async () => [], chooseUploadFile: async () => undefined,
+    openWindow: async () => undefined, onNavigate: noEvents,
+    list: async (serverId: string, path: string) => {
+      preview.sftpReads.push({ serverId, path })
+      return [{ name: 'code', path: `${path}/code`, type: 'directory', size: 4096, modifiedAt: Date.parse(iso(30)), permissions: 493 },
+        { name: 'train.py', path: `${path}/train.py`, type: 'file', size: 8912, modifiedAt: Date.parse(iso(60)), permissions: 420 }]
+    }, chooseUploadFile: async () => undefined,
     upload: async () => undefined, download: async () => undefined, onProgress: noEvents
   },
   vscode: { openRemote: async () => ({ status: 'focused', message: '' }) },
+  experiments: {
+    list: async () => structuredClone(tasks),
+    onChanged: (listener: () => void) => { taskListeners.add(listener); return () => { taskListeners.delete(listener) } },
+    save: async (input: typeof taskBase & { id?: string; title: string; status: string }) => {
+      const saved = { ...taskBase, ...input, id: input.id ?? 'new-task', runs: [] }
+      tasks = [...tasks.filter((task) => task.id !== saved.id), saved]
+      taskListeners.forEach((listener) => listener())
+      return saved
+    },
+    startRun: async (id: string, input: unknown) => {
+      preview.startedRuns.push(input)
+      const task = tasks.find((item) => item.id === id)!
+      task.status = 'queued'
+      taskListeners.forEach((listener) => listener())
+      return structuredClone(task)
+    },
+    deleteTask: async (id: string) => { tasks = tasks.filter((task) => task.id !== id); taskListeners.forEach((listener) => listener()) },
+    setArchived: async (id: string, archived: boolean) => { const task = tasks.find((item) => item.id === id)!; task.archived = archived; return structuredClone(task) }
+  },
   settings: {
-    get: async () => ({ theme: 'ocean', monitoringEnabled: true, pollingIntervalSeconds: 30, maxConcurrentPolls: 3, minimizeToTray: true, closeBehavior: 'ask', notifyOnWarning: true, serverOrder: [], gpuWatches: [] }),
+    get: async () => ({ theme: new URLSearchParams(location.search).get('theme') ?? 'ocean', monitoringEnabled: true, pollingIntervalSeconds: 30, maxConcurrentPolls: 3, minimizeToTray: true, closeBehavior: 'ask', notifyOnWarning: true, serverOrder: [], gpuWatches: [] }),
     save: async (settings: unknown) => settings
   },
   notifications: { onGpuAvailable: noEvents }
@@ -135,29 +179,28 @@ const waitFor = async (selector: string): Promise<Element> => {
 }
 
 const clickNav = async (label: string): Promise<void> => {
-  const button = [...document.querySelectorAll<HTMLButtonElement>('.nav-button')].find((item) => item.textContent?.includes(label))
+  const button = [...document.querySelectorAll<HTMLButtonElement>('.nav-button, .workbench-browser-links button')].find((item) => item.textContent?.includes(label))
   if (!button) throw new Error(`Navigation item not found: ${label}`)
   button.click()
   await new Promise((resolve) => setTimeout(resolve, 180))
 }
 
-await waitFor('.server-card')
+await waitFor('.resource-workbench')
 const view = new URLSearchParams(window.location.search).get('view') ?? 'dashboard'
 if (view === 'servers') {
-  await clickNav('服务器')
-  await waitFor('.server-table')
+  await clickNav('全部服务器')
+  await waitFor('.wb-all-server-table')
 } else if (view === 'server-detail') {
-  document.querySelector<HTMLButtonElement>('.server-title-button')?.click()
-  await waitFor('.server-detail-page')
+  await waitFor('.resource-workbench')
 } else if (view === 'gpu-overview' || view === 'gpu-detail') {
-  await clickNav('GPU 资源')
-  await waitFor('.gpu-overview-card')
+  await clickNav('GPU 总览')
+  await waitFor('.wb-pool-table')
   if (view === 'gpu-detail') {
-    document.querySelector<HTMLElement>('.gpu-overview-card')?.click()
-    await waitFor('.gpu-workspace')
+    document.querySelector<HTMLElement>('.wb-device-link')?.click()
+    await waitFor('.wb-device-page')
   }
 } else if (view === 'ssh' || view === 'ssh-picker') {
-  await clickNav('SSH 终端')
+  await clickNav('终端')
   await waitFor('.server-terminal-workspace.visible')
   if (view === 'ssh-picker') {
     document.querySelector<HTMLButtonElement>('[aria-label="选择要连接的服务器"]')?.click()

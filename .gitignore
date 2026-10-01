@@ -4,6 +4,11 @@ release/
 dist/
 coverage/
 artifacts/
+.task-preview-profile/
+.workbench-preview-profile/
+.chrome-dom-profile/
+.chrome-screenshot-dashboard/
+.screenshot-userdata/
 /实验室服务器管理平台-需求与实施方案.md
 /实验室服务器管理平台-本地桌面版需求与实施方案.md
 *.log

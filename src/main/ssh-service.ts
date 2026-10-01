@@ -120,55 +120,61 @@ export class SshService {
     return new Promise((resolve, reject) => {
       let completed = false
       let stream: ClientChannel | undefined
-      const timer = setTimeout(() => {
+      const cleanup = (): void => {
+        clearTimeout(timer)
+        client.removeListener('close', onConnectionClose)
+        client.removeListener('error', onConnectionError)
+      }
+      const fail = (error: Error): void => {
         if (completed) return
         completed = true
+        cleanup()
         stream?.close()
-        reject(new Error('远程命令执行超时'))
+        reject(error)
+      }
+      const onConnectionClose = (): void => fail(new Error('SSH 连接已关闭，请重新连接'))
+      const onConnectionError = (error: Error): void => fail(error)
+      const timer = setTimeout(() => {
+        fail(new Error('远程命令执行超时'))
       }, timeoutMs)
-      client.exec(command, (error, openedStream) => {
-        if (completed) {
-          openedStream?.close()
-          return
-        }
-        if (error) {
-          clearTimeout(timer)
-          completed = true
-          reject(error)
-          return
-        }
-        if (!openedStream) {
-          clearTimeout(timer)
-          completed = true
-          reject(new Error('SSH 未返回远程命令通道'))
-          return
-        }
-        const activeStream = openedStream
-        stream = activeStream
-        const chunks: Buffer[] = []
-        const errorChunks: Buffer[] = []
-        const fail = (streamError: Error): void => {
-          if (completed) return
-          completed = true
-          clearTimeout(timer)
-          activeStream.close()
-          reject(streamError)
-        }
-        activeStream.on('data', (chunk: Buffer) => chunks.push(chunk))
-        activeStream.on('error', fail)
-        activeStream.stderr.on('data', (chunk: Buffer) => errorChunks.push(chunk))
-        activeStream.stderr.on('error', fail)
-        activeStream.on('close', (code: number | null) => {
-          if (completed) return
-          completed = true
-          clearTimeout(timer)
-          if (code && code !== 0) {
-            reject(new Error(Buffer.concat(errorChunks).toString('utf8') || `命令退出码 ${code}`))
-          } else {
-            resolve(Buffer.concat(chunks).toString('utf8'))
+      client.once('close', onConnectionClose)
+      client.once('error', onConnectionError)
+      try {
+        client.exec(command, (error, openedStream) => {
+          if (completed) {
+            openedStream?.close()
+            return
           }
+          if (error) {
+            fail(error)
+            return
+          }
+          if (!openedStream) {
+            fail(new Error('SSH 未返回远程命令通道'))
+            return
+          }
+          const activeStream = openedStream
+          stream = activeStream
+          const chunks: Buffer[] = []
+          const errorChunks: Buffer[] = []
+          activeStream.on('data', (chunk: Buffer) => chunks.push(chunk))
+          activeStream.on('error', fail)
+          activeStream.stderr.on('data', (chunk: Buffer) => errorChunks.push(chunk))
+          activeStream.stderr.on('error', fail)
+          activeStream.on('close', (code: number | null) => {
+            if (completed) return
+            completed = true
+            cleanup()
+            if (code && code !== 0) {
+              reject(new Error(Buffer.concat(errorChunks).toString('utf8') || `命令退出码 ${code}`))
+            } else {
+              resolve(Buffer.concat(chunks).toString('utf8'))
+            }
+          })
         })
-      })
+      } catch (error) {
+        fail(error instanceof Error ? error : new Error('SSH 命令执行失败'))
+      }
     })
   }
 

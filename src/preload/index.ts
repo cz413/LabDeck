@@ -98,6 +98,9 @@ const api: AppApi = {
     setStatus: (taskId: string, status: ExperimentTaskStatus) => ipcRenderer.invoke('experiments:setStatus', taskId, status),
     startRun: (taskId: string, input: ExperimentRunStartInput) => ipcRenderer.invoke('experiments:startRun', taskId, input),
     cancelQueuedRun: (taskId: string, runId: string) => ipcRenderer.invoke('experiments:cancelQueuedRun', taskId, runId),
+    cancelRun: (taskId: string, runId: string) => ipcRenderer.invoke('experiments:cancelRun', taskId, runId),
+    deleteQueuedRun: (taskId: string, runId: string) => ipcRenderer.invoke('experiments:deleteQueuedRun', taskId, runId),
+    deleteTask: (taskId: string) => ipcRenderer.invoke('experiments:deleteTask', taskId),
     finishRun: (taskId: string, runId: string, input: ExperimentRunFinishInput) => ipcRenderer.invoke('experiments:finishRun', taskId, runId, input),
     onChanged: (listener: () => void) => {
       const handler = (): void => listener()

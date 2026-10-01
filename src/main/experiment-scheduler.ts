@@ -12,7 +12,7 @@ const RUN_ROOT = '$HOME/.local/state/labdeck/runs'
 const shellQuote = (value: string): string => `'${value.replace(/'/g, `'\\''`)}'`
 
 type RunStatePatch = Partial<Pick<ExperimentRun,
-  'status' | 'queuedAt' | 'startedAt' | 'finishedAt' | 'message' | 'gpuUuid' | 'gpuIndex' | 'gpuNameSnapshot' | 'minimumFreeVramGiB' | 'remotePid' | 'remoteRunDir' | 'logPath' | 'condaEnvironment'
+  'status' | 'queuedAt' | 'startedAt' | 'finishedAt' | 'message' | 'gpuUuid' | 'gpuIndex' | 'gpuNameSnapshot' | 'minimumFreeVramGiB' | 'maximumGpuUtilizationPercent' | 'remotePid' | 'remoteRunDir' | 'logPath' | 'condaEnvironment'
 >>
 
 const taskIsActive = (task: ExperimentTask): boolean => task.runs.some((run) =>
@@ -26,6 +26,7 @@ export class ExperimentScheduler {
   private timer: NodeJS.Timeout | null = null
   private busy = false
   private stopped = false
+  private wakeRequested = false
 
   constructor(
     private readonly store: AppStore,
@@ -57,17 +58,72 @@ export class ExperimentScheduler {
     this.timer = null
   }
 
+  wake(): void {
+    if (this.stopped) return
+    this.wakeRequested = true
+    void this.tick()
+  }
+
   private async tick(): Promise<void> {
     if (this.stopped || this.busy) return
     this.busy = true
+    const prioritizeQueuedRun = this.wakeRequested
+    this.wakeRequested = false
     try {
-      await this.refreshRunningRuns()
-      if (!this.stopped) await this.dispatchQueuedRun()
+      if (prioritizeQueuedRun) {
+        await this.dispatchQueuedRun()
+        if (!this.stopped) await this.refreshRunningRuns()
+      } else {
+        await this.refreshRunningRuns()
+        if (!this.stopped) await this.dispatchQueuedRun()
+      }
     } catch (error) {
       console.warn('实验任务调度轮询失败：', error)
     } finally {
       this.busy = false
+      if (this.wakeRequested && !this.stopped) {
+        this.wakeRequested = false
+        queueMicrotask(() => void this.tick())
+      }
     }
+  }
+
+  async cancelRun(taskId: string, runId: string): Promise<ExperimentTask> {
+    const task = this.store.listExperimentTasks().find((item) => item.id === taskId)
+    const run = task?.runs.find((item) => item.id === runId)
+    if (!task || !run) throw new Error('实验运行记录不存在')
+    if (run.status === 'queued') return this.store.cancelQueuedExperimentRun(taskId, runId)
+    if (run.status !== 'preparing' && run.status !== 'running') throw new Error('只有正在准备或运行中的任务可以取消')
+
+    if (run.status === 'running' && run.remoteRunDir) {
+      const serverId = run.serverId ?? task.serverId
+      if (!serverId) throw new Error('找不到运行任务对应的服务器，无法终止远程进程')
+      const server = this.store.getServer(serverId)
+      const routeId = run.accessRouteId ?? getDefaultAccessRouteId(server)
+      const profile = applyAccessRoute(server, routeId)
+      const secrets = this.store.getSecrets(serverId)
+      await this.terminateRemoteRun(profile, secrets, run.remoteRunDir, run.remotePid)
+    } else if (run.status === 'running' && run.remotePid) {
+      const serverId = run.serverId ?? task.serverId
+      if (!serverId) throw new Error('找不到运行任务对应的服务器，无法终止远程进程')
+      const server = this.store.getServer(serverId)
+      const routeId = run.accessRouteId ?? getDefaultAccessRouteId(server)
+      const profile = applyAccessRoute(server, routeId)
+      const secrets = this.store.getSecrets(serverId)
+      await this.execRemote(profile, secrets, `kill -TERM ${run.remotePid} 2>/dev/null || true`, 10_000)
+    }
+
+    await this.store.updateExperimentRunState(taskId, runId, {
+      status: 'cancelled',
+      finishedAt: new Date().toISOString(),
+      message: run.status === 'running' ? '已向远程运行进程组发送终止信号' : '任务在准备阶段被取消'
+    }, run.status)
+    const updated = this.store.listExperimentTasks().find((item) => item.id === taskId) ?? task
+    if (updated.runs.find((item) => item.id === runId)?.status !== 'cancelled') {
+      throw new Error('任务状态已变化，未能取消；请刷新状态后重试')
+    }
+    this.onChanged()
+    return updated
   }
 
   private async refreshRunningRuns(): Promise<void> {
@@ -94,7 +150,7 @@ export class ExperimentScheduler {
             await this.updateRun(task.id, run.id, {
               status: exitCode === 0 ? 'completed' : 'failed',
               finishedAt: new Date().toISOString(),
-              message: exitCode === 0 ? '启动命令已正常结束' : `启动命令退出码：${exitCode}`
+              message: exitCode === 0 ? '启动命令已正常结束' : `异常退出：启动命令返回退出码 ${exitCode}`
             }, 'running')
           }
         } else if (status.trim() === 'lost') {
@@ -115,7 +171,8 @@ export class ExperimentScheduler {
     const queue = this.store.listExperimentTasks()
       .filter((task) => !task.archived && taskIsActive(task))
       .flatMap((task) => task.runs.filter((run) => run.status === 'queued').map((run) => ({ task, run })))
-      .sort((left, right) => queuedPriority(left.task.priority) - queuedPriority(right.task.priority) ||
+      .sort((left, right) => Number(Boolean(right.run.gpuUuid || right.run.gpuIndex !== undefined)) - Number(Boolean(left.run.gpuUuid || left.run.gpuIndex !== undefined)) ||
+        queuedPriority(left.task.priority) - queuedPriority(right.task.priority) ||
         Date.parse(left.run.queuedAt ?? left.run.startedAt ?? '') - Date.parse(right.run.queuedAt ?? right.run.startedAt ?? ''))
 
     for (const item of queue) {
@@ -131,6 +188,9 @@ export class ExperimentScheduler {
     const minimumFreeVramGiB = run.minimumFreeVramGiB !== undefined
       ? run.minimumFreeVramGiB ?? undefined
       : task.minimumFreeVramGiB
+    const maximumGpuUtilizationPercent = run.maximumGpuUtilizationPercent !== undefined
+      ? run.maximumGpuUtilizationPercent ?? undefined
+      : task.maximumGpuUtilizationPercent
 
     const serverId = run.serverId ?? task.serverId
     if (!serverId) return this.waitInQueue(task.id, run.id, '请先为任务指定服务器')
@@ -165,11 +225,15 @@ export class ExperimentScheduler {
     }
     if (this.stopped) return false
     if (firstSnapshot.status === 'offline') return this.waitInQueue(task.id, run.id, `等待服务器连接：${firstSnapshot.error ?? '当前离线'}`)
-    if (!this.selectIdleGpu(firstSnapshot.gpus, minimumFreeVramGiB)) {
-      const requirement = minimumFreeVramGiB ? `（需至少 ${minimumFreeVramGiB} GiB 空闲显存）` : ''
-      return this.waitInQueue(task.id, run.id, `该服务器当前没有符合显存条件的空闲 GPU${requirement}，任务仍在队列中`)
+    if (!this.selectGpu(firstSnapshot.gpus, run, minimumFreeVramGiB, maximumGpuUtilizationPercent)) {
+      const requirement = this.gpuRequirement(minimumFreeVramGiB, maximumGpuUtilizationPercent)
+      const message = run.gpuUuid || run.gpuIndex !== undefined
+        ? `等待指定 GPU ${run.gpuIndex ?? ''} 出现在最新采样中`
+        : `当前没有符合条件的 GPU${requirement}，任务仍在队列中`
+      return this.waitInQueue(task.id, run.id, message)
     }
-    await this.updateRun(task.id, run.id, { status: 'preparing', message: '发现空闲 GPU，正在检查目录和 Conda 环境' }, 'queued')
+    const targetDescription = run.gpuUuid || run.gpuIndex !== undefined ? `GPU ${run.gpuIndex}` : '符合条件的 GPU'
+    await this.updateRun(task.id, run.id, { status: 'preparing', message: `已选择 ${targetDescription}，正在检查目录和 Conda 环境` }, 'queued')
     if (this.findRun(task.id, run.id)?.status !== 'preparing') return false
 
     const codePath = run.codePath?.trim() ?? ''
@@ -209,11 +273,15 @@ export class ExperimentScheduler {
     if (this.stopped || this.findRun(task.id, run.id)?.status !== 'preparing') return false
     const latestSnapshot = await this.monitor.snapshot(profile, secrets)
     if (this.stopped) return false
+    if (this.findRun(task.id, run.id)?.status !== 'preparing') return false
     if (latestSnapshot.status === 'offline') return this.waitInQueue(task.id, run.id, `启动前服务器失联：${latestSnapshot.error ?? '当前离线'}`)
-    const selectedGpu = this.selectIdleGpu(latestSnapshot.gpus, minimumFreeVramGiB)
+    const selectedGpu = this.selectGpu(latestSnapshot.gpus, run, minimumFreeVramGiB, maximumGpuUtilizationPercent)
     if (!selectedGpu) {
-      const requirement = minimumFreeVramGiB ? `（需至少 ${minimumFreeVramGiB} GiB 空闲显存）` : ''
-      return this.waitInQueue(task.id, run.id, `启动前没有符合显存条件的空闲 GPU${requirement}，继续等待`)
+      const requirement = this.gpuRequirement(minimumFreeVramGiB, maximumGpuUtilizationPercent)
+      const message = run.gpuUuid || run.gpuIndex !== undefined
+        ? `启动前未找到指定 GPU ${run.gpuIndex ?? ''}，继续等待该 GPU`
+        : `启动前没有符合条件的 GPU${requirement}，继续等待`
+      return this.waitInQueue(task.id, run.id, message)
     }
 
     try {
@@ -227,18 +295,27 @@ export class ExperimentScheduler {
         condaEnvironment: condaConfig
       }, profile, secrets, selectedGpu.index)
       if (this.stopped) return false
+      if (this.findRun(task.id, run.id)?.status !== 'preparing') {
+        try {
+          await this.terminateRemoteRun(profile, secrets, launched.runDir, launched.pid)
+        } catch (error) {
+          console.error('取消准备中的实验后清理远程进程失败：', error)
+        }
+        return false
+      }
       const startedAt = new Date().toISOString()
       const freeVramGiB = (selectedGpu.memoryTotalMiB - selectedGpu.memoryUsedMiB) / 1024
       await this.updateRun(task.id, run.id, {
         status: 'running',
         startedAt,
-        message: `已在 GPU ${selectedGpu.index} 启动（采样空闲显存 ${freeVramGiB.toFixed(freeVramGiB >= 10 ? 0 : 1)} GiB）；日志：${launched.logPath}`,
+        message: `已在 GPU ${selectedGpu.index} 启动（利用率 ${selectedGpu.utilizationPercent}% · 空闲显存 ${freeVramGiB.toFixed(freeVramGiB >= 10 ? 0 : 1)} GiB）；日志：${launched.logPath}`,
         gpuUuid: selectedGpu.uuid,
         gpuIndex: selectedGpu.index,
         gpuNameSnapshot: selectedGpu.name,
         remotePid: launched.pid,
         remoteRunDir: launched.runDir,
-        logPath: launched.logPath
+        logPath: launched.logPath,
+        maximumGpuUtilizationPercent
       }, 'preparing')
       return true
     } catch (error) {
@@ -247,14 +324,59 @@ export class ExperimentScheduler {
     }
   }
 
-  private selectIdleGpu(gpus: Awaited<ReturnType<MonitorService['snapshot']>>['gpus'][number][], minimumFreeVramGiB?: number) {
+  private selectGpu(
+    gpus: Awaited<ReturnType<MonitorService['snapshot']>>['gpus'][number][],
+    run: ExperimentRun,
+    minimumFreeVramGiB?: number,
+    maximumGpuUtilizationPercent?: number
+  ) {
+    if (run.gpuUuid || run.gpuIndex !== undefined) {
+      return gpus.find((gpu) => run.gpuUuid ? gpu.uuid === run.gpuUuid : gpu.index === run.gpuIndex)
+    }
     return gpus
       .filter((gpu) => {
         const freeMemoryMiB = gpu.memoryTotalMiB - gpu.memoryUsedMiB
-        return gpu.uuid && gpu.memoryTotalMiB > 0 && gpu.temperatureC < 80 && !isGpuBusy(gpu) &&
+        const utilizationAllowed = maximumGpuUtilizationPercent === undefined
+          ? !isGpuBusy(gpu)
+          : gpu.utilizationPercent <= maximumGpuUtilizationPercent
+        return gpu.uuid && gpu.memoryTotalMiB > 0 && gpu.temperatureC < 80 && utilizationAllowed &&
           (minimumFreeVramGiB === undefined || freeMemoryMiB >= minimumFreeVramGiB * 1024)
       })
-      .sort((left, right) => (right.memoryTotalMiB - right.memoryUsedMiB) - (left.memoryTotalMiB - left.memoryUsedMiB))[0]
+      .sort((left, right) => maximumGpuUtilizationPercent === undefined
+        ? (right.memoryTotalMiB - right.memoryUsedMiB) - (left.memoryTotalMiB - left.memoryUsedMiB)
+        : left.utilizationPercent - right.utilizationPercent || (right.memoryTotalMiB - right.memoryUsedMiB) - (left.memoryTotalMiB - left.memoryUsedMiB))[0]
+  }
+
+  private gpuRequirement(minimumFreeVramGiB?: number, maximumGpuUtilizationPercent?: number): string {
+    const requirements = [
+      minimumFreeVramGiB === undefined ? undefined : `空闲显存 ≥ ${minimumFreeVramGiB} GiB`,
+      maximumGpuUtilizationPercent === undefined ? undefined : `利用率 ≤ ${maximumGpuUtilizationPercent}%`
+    ].filter(Boolean)
+    return requirements.length ? `（${requirements.join('，')}）` : ''
+  }
+
+  private async terminateRemoteRun(
+    profile: ReturnType<typeof applyAccessRoute>,
+    secrets: ReturnType<AppStore['getSecrets']>,
+    runDir: string,
+    knownPid?: number
+  ): Promise<void> {
+    const pidFallback = knownPid ? String(knownPid) : ''
+    const command = [
+      `run_dir=${shellQuote(runDir)}`,
+      `pid=${shellQuote(pidFallback)}`,
+      'if [ -f "$run_dir/exit-code" ]; then printf "finished\\n"; exit 0; fi',
+      'if [ -s "$run_dir/pid" ]; then pid=$(cat "$run_dir/pid"); fi',
+      'case "$pid" in ""|*[!0-9]*) printf "missing\\n"; exit 0 ;; esac',
+      'if ! kill -0 "$pid" 2>/dev/null; then printf "stopped\\n"; exit 0; fi',
+      'pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d " ")',
+      'if [ "$pgid" = "$pid" ]; then kill -TERM -- "-$pid" 2>/dev/null || true; else kill -TERM "$pid" 2>/dev/null || true; fi',
+      'sleep 3',
+      'if [ "$pgid" = "$pid" ] && kill -0 -- "-$pid" 2>/dev/null; then kill -KILL -- "-$pid" 2>/dev/null || true; elif kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi',
+      'printf "stopped\\n"'
+    ].join('; ')
+    const output = await this.execRemote(profile, secrets, command, 12_000)
+    if (output.trim() === 'finished') throw new Error('进程已正常结束，正在同步最新状态；请稍后刷新')
   }
 
   private async launchRemoteRun(
@@ -293,7 +415,7 @@ export class ExperimentScheduler {
       'mkdir -p "$run_dir"',
       `printf '%s' '${encoded}' | base64 -d > "$run_dir/run.sh"`,
       'chmod 700 "$run_dir/run.sh"',
-      `(nohup bash "$run_dir/run.sh" > "$run_dir/stdout.log" 2>&1 < /dev/null & pid=$!; printf '%s\\n' "$pid" > "$run_dir/pid"; printf '%s\\n%s\\n' "$run_dir" "$pid")`
+      `(if command -v setsid >/dev/null 2>&1; then nohup setsid bash "$run_dir/run.sh" > "$run_dir/stdout.log" 2>&1 < /dev/null & else nohup bash "$run_dir/run.sh" > "$run_dir/stdout.log" 2>&1 < /dev/null & fi; pid=$!; printf '%s\\n' "$pid" > "$run_dir/pid"; printf '%s\\n%s\\n' "$run_dir" "$pid")`
     ].join(' && ')
     const output = await this.execRemote(profile, secrets, command, 20_000)
     const lines = output.trim().split(/\r?\n/)

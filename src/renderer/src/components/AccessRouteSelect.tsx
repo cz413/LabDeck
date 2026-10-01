@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useId, useRef, useState } from 'react'
 import { Check, ChevronDown } from 'lucide-react'
 import type { ServerProfile } from '@shared/types'
 import { getAccessRoute, getAccessRoutes } from '@shared/access-routes'
@@ -8,14 +8,16 @@ interface AccessRouteSelectProps {
   value: string
   onChange(routeId: string): void
   compact?: boolean
+  label?: string
+  showSingleRoute?: boolean
 }
 
-export function AccessRouteSelect({ server, value, onChange, compact = false }: AccessRouteSelectProps): React.JSX.Element | null {
+export function AccessRouteSelect({ server, value, onChange, compact = false, label, showSingleRoute = false }: AccessRouteSelectProps): React.JSX.Element | null {
   const routes = getAccessRoutes(server)
   const selectedRoute = getAccessRoute(server, value)
   const [open, setOpen] = useState(false)
   const rootRef = useRef<HTMLDivElement>(null)
-  const menuId = `access-route-menu-${server.id}-${compact ? 'compact' : 'full'}`
+  const menuId = useId()
 
   useEffect(() => {
     if (!open) return
@@ -33,7 +35,16 @@ export function AccessRouteSelect({ server, value, onChange, compact = false }: 
     }
   }, [open])
 
-  if (routes.length <= 1) return null
+  if (routes.length <= 1) {
+    if (!showSingleRoute) return null
+    return <div className={`access-route-select route-${selectedRoute.kind} ${compact ? 'compact' : ''}`}>
+      <div className="access-route-trigger access-route-static">
+        <i className="access-route-indicator" aria-hidden="true" />
+        <span className="access-route-caption">{label ?? (compact ? '连接' : '连接路径')}</span>
+        <strong>{selectedRoute.kind === 'jump' ? '跳板机' : '直连'}</strong>
+      </div>
+    </div>
+  }
 
   const chooseRoute = (routeId: string): void => {
     onChange(routeId)
@@ -51,7 +62,7 @@ export function AccessRouteSelect({ server, value, onChange, compact = false }: 
       onClick={() => setOpen((current) => !current)}
     >
       <i className="access-route-indicator" aria-hidden="true" />
-      <span className="access-route-caption">{compact ? '连接' : '连接路径'}</span>
+      <span className="access-route-caption">{label ?? (compact ? '连接' : '连接路径')}</span>
       <strong>{selectedRoute.name}</strong>
       <ChevronDown className="access-route-chevron" size={14} aria-hidden="true" />
     </button>

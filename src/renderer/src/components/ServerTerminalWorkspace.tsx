@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Code2, FolderOpen, Laptop, Plus, Server, SquareTerminal, X } from 'lucide-react'
 import type { ServerProfile } from '@shared/types'
 import { getAccessRoute, getAccessRoutes } from '@shared/access-routes'
@@ -62,6 +63,8 @@ export function ServerTerminalWorkspace({
 }: TerminalWorkspaceProps): React.JSX.Element {
   const [serverPickerPurpose, setServerPickerPurpose] = useState<'terminal' | 'files' | null>(null)
   const pickerRef = useRef<HTMLDivElement>(null)
+  const menuRef = useRef<HTMLDivElement>(null)
+  const [pickerPosition, setPickerPosition] = useState<{ top: number; left: number; width: number; maxHeight: number; placement: 'above' | 'below' } | null>(null)
   const addButtonRef = useRef<HTMLButtonElement>(null)
   const filesButtonRef = useRef<HTMLButtonElement>(null)
   const activeSession = sessions.find((session) => session.id === activeId) ?? null
@@ -71,7 +74,7 @@ export function ServerTerminalWorkspace({
   useEffect(() => {
     if (!serverPickerOpen) return
     const handlePointerDown = (event: PointerEvent): void => {
-      if (!pickerRef.current?.contains(event.target as Node)) setServerPickerPurpose(null)
+      if (!pickerRef.current?.contains(event.target as Node) && !menuRef.current?.contains(event.target as Node)) setServerPickerPurpose(null)
     }
     const handleKeyDown = (event: KeyboardEvent): void => {
       if (event.key === 'Escape') {
@@ -87,6 +90,48 @@ export function ServerTerminalWorkspace({
       window.removeEventListener('keydown', handleKeyDown)
     }
   }, [serverPickerOpen, serverPickerPurpose])
+
+  useLayoutEffect(() => {
+    if (!visible || !serverPickerPurpose) {
+      setPickerPosition(null)
+      return
+    }
+    const anchor = serverPickerPurpose === 'files' ? filesButtonRef.current : addButtonRef.current
+    const menu = menuRef.current
+    if (!anchor || !menu) return
+    const positionMenu = (): void => {
+      const rect = anchor.getBoundingClientRect()
+      const margin = 8
+      const gap = 7
+      const below = Math.max(0, window.innerHeight - rect.bottom - gap - margin)
+      const above = Math.max(0, rect.top - gap - margin)
+      const desiredHeight = Math.min(420, menu.scrollHeight + 2)
+      const placement = below >= desiredHeight || below >= above ? 'below' : 'above'
+      const maxHeight = Math.min(420, placement === 'below' ? below : above)
+      const width = Math.min(320, window.innerWidth - margin * 2)
+      const next = {
+        top: placement === 'below' ? rect.bottom + gap : Math.max(margin, rect.top - gap - Math.min(desiredHeight, maxHeight)),
+        left: Math.max(margin, Math.min(rect.right - width, window.innerWidth - width - margin)),
+        width,
+        maxHeight,
+        placement
+      } as const
+      setPickerPosition((current) => current && Object.keys(next).every((key) => current[key as keyof typeof next] === next[key as keyof typeof next]) ? current : next)
+    }
+    positionMenu()
+    const observer = new ResizeObserver(positionMenu)
+    observer.observe(anchor)
+    observer.observe(menu)
+    const workspace = pickerRef.current?.closest('.server-terminal-workspace')
+    if (workspace) observer.observe(workspace)
+    window.addEventListener('resize', positionMenu)
+    window.addEventListener('scroll', positionMenu, true)
+    return () => {
+      observer.disconnect()
+      window.removeEventListener('resize', positionMenu)
+      window.removeEventListener('scroll', positionMenu, true)
+    }
+  }, [visible, serverPickerPurpose, servers])
 
   useEffect(() => {
     if (!visible) setServerPickerPurpose(null)
@@ -226,8 +271,8 @@ export function ServerTerminalWorkspace({
           >
             <FolderOpen size={15} /><span>文件</span>
           </button>
-          {serverPickerOpen && (
-            <div className="ssh-server-picker terminal-add-picker" id="terminal-add-picker" role="group" aria-label={serverPickerPurpose === 'terminal' ? '新建终端会话' : '选择服务器'}>
+          {serverPickerOpen && visible && createPortal(
+            <div ref={menuRef} className="ssh-server-picker terminal-add-picker" id="terminal-add-picker" role="group" aria-label={serverPickerPurpose === 'terminal' ? '新建终端会话' : '选择服务器'} data-placement={pickerPosition?.placement} style={pickerPosition ? { top: pickerPosition.top, left: pickerPosition.left, width: pickerPosition.width, maxHeight: pickerPosition.maxHeight } : { visibility: 'hidden' }}>
               {serverPickerPurpose === 'terminal' ? <>
                 <strong className="ssh-server-picker-heading">新建终端</strong>
                 <button type="button" className="ssh-server-choice local-terminal-choice" onClick={addLocalTerminal}>
@@ -239,7 +284,7 @@ export function ServerTerminalWorkspace({
               </> : <strong className="ssh-server-picker-heading">选择服务器</strong>}
               {(serverPickerPurpose === 'files' || serverPickerPurpose === 'terminal') && servers.map(renderServerRoutes)}
               {serverPickerPurpose === 'files' && !servers.length && <span className="ssh-server-picker-empty">还没有可用的服务器</span>}
-            </div>
+            </div>, document.body
           )}
         </div>
       </div>
