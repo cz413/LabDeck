@@ -187,8 +187,13 @@ button:disabled { opacity: .45; cursor: not-allowed; }
 .wb-history-selector { display: flex; align-items: center; gap: 10px; margin: 3px 0 17px; color: var(--muted); }
 .wb-history-selector select { background: var(--control-bg); color: var(--text); border: 1px solid var(--border); padding: 6px; border-radius: 3px; font-size: 11px; }
 .workbench-terminal-dock { min-height: 0; flex: 0 0 31px; border-top: 1px solid var(--border); display: flex; flex-direction: column; }
-.workbench-terminal-dock.expanded { height: clamp(190px, 30vh, 330px); flex-basis: clamp(190px, 30vh, 330px); }
+.workbench-terminal-dock.expanded { height: 330px; flex-basis: 330px; }
 .workbench-terminal-dock.fullscreen { height: auto; flex: 1; }
+.workbench-dock-resizer { height: 8px; flex: 0 0 8px; display: flex; align-items: center; justify-content: center; cursor: ns-resize; touch-action: none; background: var(--sidebar); }
+.workbench-dock-resizer > span { width: 44px; height: 2px; border-radius: 2px; background: var(--muted-2); }
+.workbench-dock-resizer:hover, .workbench-dock-resizer:focus-visible, .workbench-terminal-dock.resizing .workbench-dock-resizer { background: var(--accent-surface); }
+.workbench-dock-resizer:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; }
+.workbench-terminal-dock.resizing .workbench-dock-resizer > span { background: var(--blue); }
 .workbench-dock-heading { display: flex; align-items: center; justify-content: space-between; height: 30px; min-height: 30px; padding: 0 10px; background: var(--sidebar); }
 .workbench-dock-heading > div { display: flex; align-items: center; gap: 7px; }
 .workbench-dock-heading button { display: inline-flex; align-items: center; gap: 7px; height: 27px; border: 0; color: var(--muted); background: none; font-size: 10px; cursor: pointer; }
@@ -283,7 +288,6 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   .workbench-search { display: none; }
   .wb-host-actions { margin-left: 0; }
   .wb-section-hint { display: none; }
-  .workbench-terminal-dock.expanded { height: 220px; flex-basis: 220px; }
 }
 @media (prefers-reduced-motion: reduce) { .workbench-shell * { scroll-behavior: auto; transition: none; animation-duration: 0.01ms; } }
 
