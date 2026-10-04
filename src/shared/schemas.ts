@@ -47,7 +47,9 @@ export const serverProfileInputSchema = z.object({
 })
 
 export const appSettingsSchema = z.object({
-  theme: z.enum(['ocean', 'instrument', 'machineRoom']).default('ocean'),
+  // Keep older settings readable without discarding the rest of the user's data.
+  theme: z.enum(['ocean', 'instrument', 'machineRoom']).default('ocean')
+    .transform((theme) => theme === 'machineRoom' ? 'ocean' : theme),
   monitoringEnabled: z.boolean(),
   pollingIntervalSeconds: z.number().int().min(10).max(3600),
   maxConcurrentPolls: z.number().int().min(1).max(20),

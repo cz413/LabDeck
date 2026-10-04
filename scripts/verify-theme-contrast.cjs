@@ -55,7 +55,7 @@ function auditText() {
 }
 
 async function main() {
-  app.setPath('userData', path.join(root, '.workbench-preview-profile'))
+  app.setPath('userData', path.join(root, 'artifacts', 'theme-profile-' + process.pid))
   await app.whenReady()
   const { createServer } = await import('vite')
   const react = (await import('@vitejs/plugin-react')).default
@@ -79,7 +79,7 @@ async function main() {
   }
   await fs.mkdir(path.join(root, 'artifacts/theme-contrast'), { recursive: true })
   const results = []
-  for (const theme of ['ocean', 'instrument', 'machineRoom']) {
+  for (const theme of ['ocean', 'instrument']) {
     await win.loadURL(`http://127.0.0.1:4322/screenshot-harness.html?theme=${theme}`)
     await waitFor('window.__captureReady')
     const sample = async (page, capture = false) => {
@@ -88,7 +88,8 @@ async function main() {
       await fs.writeFile(path.join(root, `artifacts/theme-contrast/${auditOnly ? 'before' : 'after'}.json`), JSON.stringify(results, null, 2))
       console.log(`${theme}/${page}: ${result.checked} text elements, ${result.findings.length} low contrast`)
       if (capture) {
-        win.setSize(1441, 1000); await delay(); win.setSize(1440, 1000); await delay(250)
+        const [width, height] = win.getSize()
+        win.setSize(width + 1, height); await delay(); win.setSize(width, height); await delay(250)
         await fs.writeFile(path.join(root, `artifacts/theme-contrast/${theme}-${page}.png`), (await win.webContents.capturePage()).toPNG())
       }
     }
@@ -107,6 +108,11 @@ async function main() {
     await click('.experiment-task-card button', '编辑'); await sample('task-editor', true)
     await click('.app-modal .dialog-header .icon-button');
     await click('.workbench-modulebar > button', '设置'); await sample('settings', true)
+    if (!await run(`document.querySelectorAll('.theme-option').length === 2 && !document.querySelector('.theme-preview.machineRoom') && document.querySelectorAll('.theme-option[aria-pressed=true]').length === 1`)) throw new Error('Settings should offer exactly two themes')
+    win.setSize(850, 950); await delay()
+    await sample('settings-narrow', true)
+    if (!await run('document.querySelector(".settings-page-stack").scrollWidth <= document.querySelector(".workbench-main").clientWidth')) throw new Error('Narrow settings overflow')
+    win.setSize(1440, 1000); await delay()
     await click('.workbench-modulebar > button', '告警'); await sample('alerts')
     await click('.workbench-modulebar .nav-button', '资源');
     await click('.wb-host-actions button', '打开文件'); await waitFor('document.querySelectorAll(".file-row").length === 2'); await sample('files')

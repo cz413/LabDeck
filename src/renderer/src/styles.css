@@ -652,7 +652,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 
 .settings-page-stack { display: grid; gap: 14px; }
 .appearance-panel { padding: 18px; }
-.theme-options { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-top: 15px; }
+.theme-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; margin-top: 15px; }
 .theme-option { position: relative; min-height: 84px; display: grid; grid-template-columns: 84px 1fr; grid-template-rows: auto auto; align-content: center; gap: 3px 13px; padding: 11px; color: var(--text); text-align: left; background: var(--panel-soft); border: 1px solid var(--border); border-radius: 5px; cursor: pointer; }
 .theme-option:hover { border-color: #53616c; }
 .theme-option.selected { border-color: var(--teal); box-shadow: inset 0 0 0 1px var(--teal); }
@@ -664,7 +664,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .theme-preview i:first-child { grid-row: 1 / 3; }
 .theme-preview.ocean { background: #0b1117; }.theme-preview.ocean i { background: #25313b; }.theme-preview.ocean i:last-child { background: #183b39; }
 .theme-preview.instrument { background: #edf1f3; }.theme-preview.instrument i { background: #cdd6dc; }.theme-preview.instrument i:last-child { background: #2d7470; }
-.theme-preview.machineRoom { background: #050807; }.theme-preview.machineRoom i { background: #17201b; }.theme-preview.machineRoom i:last-child { background: #50ad72; }
 
 .terminal-panel { width: min(1120px, calc(100vw - 48px)); height: min(720px, calc(100vh - 48px)); min-width: 620px; min-height: 420px; resize: both; }
 .terminal-panel.maximized { width: auto; height: auto; resize: none; }
@@ -689,15 +688,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 :root[data-theme="instrument"] .security-check strong, :root[data-theme="instrument"] .gpu-process-title h3 { color: #26343c; }
 :root[data-theme="instrument"] .security-check span, :root[data-theme="instrument"] .settings-field span { color: var(--muted); }
 :root[data-theme="instrument"] .terminal-panel { background: #07101d; color: #e3e9ee; }
-
-:root[data-theme="machineRoom"] { color-scheme: dark; --bg: #050807; --bg-deep: #030504; --sidebar: #070b09; --panel: #0a100c; --panel-soft: #0d1510; --border: #26342b; --border-soft: #17231b; --text: #deebe2; --muted: #84968a; --muted-2: #5e7164; --teal: #62c985; --teal-dark: #163820; --blue: #68a8c4; --amber: #d8aa4e; --red: #e0656d; --violet: #9d8bb3; }
-:root[data-theme="machineRoom"] .app-shell, :root[data-theme="machineRoom"] .topbar, :root[data-theme="machineRoom"] .sidebar { background: var(--bg); }
-:root[data-theme="machineRoom"] .brand-mark { color: #061009; background: #58b878; }
-:root[data-theme="machineRoom"] .nav-button:hover { color: var(--icon-hover); background: var(--surface-hover); }
-:root[data-theme="machineRoom"] .nav-button.active { color: var(--text); background: var(--surface-active); box-shadow: inset 2px 0 var(--accent-text); }
-:root[data-theme="machineRoom"] .summary-card, :root[data-theme="machineRoom"] .server-card, :root[data-theme="machineRoom"] .panel, :root[data-theme="machineRoom"] .gpu-pool-summary > div, :root[data-theme="machineRoom"] .gpu-overview-card, :root[data-theme="machineRoom"] .gpu-stat, :root[data-theme="machineRoom"] .gpu-history-panel, :root[data-theme="machineRoom"] .gpu-process-panel, :root[data-theme="machineRoom"] .gpu-hardware-strip { background: #0a100c; }
-:root[data-theme="machineRoom"] .search-box, :root[data-theme="machineRoom"] .icon-button.top, :root[data-theme="machineRoom"] .gpu-filter-bar, :root[data-theme="machineRoom"] .theme-option, :root[data-theme="machineRoom"] .field input, :root[data-theme="machineRoom"] .field select, :root[data-theme="machineRoom"] .settings-field select, :root[data-theme="machineRoom"] .gpu-filter-bar select { color: var(--text); background: #080d0a; border-color: #26342b; }
-:root[data-theme="machineRoom"] .server-symbol, :root[data-theme="machineRoom"] .gpu-chip { color: #72d391; background: #122b19; }
 
 @media (max-width: 980px) {
   .theme-options { grid-template-columns: 1fr; }
@@ -743,26 +733,6 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   --warning-soft: #f4ead6;
   --danger-soft: #f3dfe1;
   --success-soft: #dcefe5;
-}
-
-:root[data-theme="machineRoom"] {
-  --surface-raised: #0a100c;
-  --surface-subtle: #0d1510;
-  --surface-hover: #142019;
-  --surface-active: #17251b;
-  --control-bg: #101912;
-  --control-hover: #18241b;
-  --interactive-border: #3b5141;
-  --icon: #789180;
-  --icon-hover: #e0eee3;
-  --accent-surface: #122b19;
-  --accent-text: #72d391;
-  --track-bg: #1a281e;
-  --separator: #17231b;
-  --scrollbar: #344b39;
-  --warning-soft: #342b18;
-  --danger-soft: #351d22;
-  --success-soft: #16331f;
 }
 
 .icon-button { color: var(--icon); }
@@ -2144,12 +2114,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   flex: 0 0 auto;
   background: var(--accent-text);
   border-radius: 50%;
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-text) 13%, transparent);
+  box-shadow: none;
 }
 
 .access-route-select.route-jump .access-route-indicator {
   background: var(--blue);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent);
+  box-shadow: none;
 }
 
 .access-route-select span {
@@ -2319,10 +2289,15 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   height: 16px;
 }
 
-.access-route-select {
+.access-route-select,
+.access-route-select:hover,
+.access-route-select:focus-within,
+.access-route-select.compact,
+:root[data-theme="instrument"] .access-route-select {
   position: relative;
   display: inline-block;
-  min-width: 148px;
+  width: fit-content;
+  min-width: 0;
   height: auto;
   padding: 0;
   color: var(--text);
@@ -2347,7 +2322,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   background: var(--surface-subtle);
   border: 1px solid color-mix(in srgb, var(--accent-text) 42%, var(--border));
   border-radius: 7px;
-  box-shadow: inset 0 1px rgba(255, 255, 255, .035);
+  box-shadow: none;
   cursor: pointer;
   font: inherit;
   text-align: left;
@@ -2358,12 +2333,12 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .access-route-select.open .access-route-trigger {
   background: var(--control-hover);
   border-color: var(--accent-text);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent-text) 10%, transparent);
+  box-shadow: none;
 }
 
 .access-route-trigger:focus-visible {
-  outline: 2px solid var(--accent-text);
-  outline-offset: 2px;
+  outline: 1px solid var(--accent-text);
+  outline-offset: -2px;
 }
 
 .access-route-caption {
@@ -2399,9 +2374,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   transform: rotate(180deg);
 }
 
-.access-route-select.compact,
 .access-route-select.compact .access-route-trigger {
-  min-width: 116px;
+  min-width: 0;
 }
 
 .access-route-select.compact .access-route-trigger {
@@ -2435,8 +2409,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   z-index: 180;
   min-width: 178px;
   display: grid;
-  gap: 3px;
-  padding: 5px;
+  gap: 0;
+  padding: 0;
   overflow: hidden;
   color: var(--text);
   background: var(--surface-raised);
@@ -2467,8 +2441,8 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
   padding: 6px 8px;
   color: var(--text);
   background: transparent;
-  border: 1px solid transparent;
-  border-radius: 6px;
+  border: 0;
+  border-radius: 0;
   cursor: pointer;
   text-align: left;
 }
@@ -2478,9 +2452,10 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .access-route-option.selected {
   color: var(--text);
   background: var(--control-hover);
-  border-color: var(--interactive-border);
   outline: none;
 }
+
+.access-route-option:focus-visible { outline: 1px solid var(--accent-text); outline-offset: -2px; }
 
 .access-route-option > span {
   min-width: 0;
@@ -2522,7 +2497,7 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 
 .access-route-option.route-jump .access-route-indicator {
   background: var(--blue);
-  box-shadow: 0 0 0 3px color-mix(in srgb, var(--blue) 14%, transparent);
+  box-shadow: none;
 }
 
 @media (max-width: 420px) {

@@ -1,10 +1,28 @@
 import { useEffect, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import { ClipboardPaste, Copy, KeyRound, Laptop, Maximize2, RefreshCw, Server, X } from 'lucide-react'
-import { Terminal } from '@xterm/xterm'
+import { Terminal, type ITheme } from '@xterm/xterm'
 import { FitAddon } from '@xterm/addon-fit'
 import type { ServerProfile } from '@shared/types'
 import { getAccessRoute } from '@shared/access-routes'
 import type { ConfirmationRequest } from './ConfirmDialog'
+
+const terminalThemes: Record<'ocean' | 'instrument', ITheme> = {
+  ocean: {
+    background: '#191b1d', foreground: '#e2e5e8', cursor: '#a7bed2',
+    selectionBackground: '#536a80aa', black: '#0b1524', red: '#ff6b7d',
+    green: '#67d391', yellow: '#e9c46a', blue: '#66a7ff', magenta: '#c79cff',
+    cyan: '#64d8cb', white: '#eef5ff'
+  },
+  instrument: {
+    background: '#fbfcfc', foreground: '#263238', cursor: '#176b63', cursorAccent: '#fbfcfc',
+    selectionBackground: '#b7d8d2', selectionForeground: '#1c3935', black: '#263238',
+    red: '#ad3445', green: '#28704b', yellow: '#885b13', blue: '#2a6091',
+    magenta: '#79539a', cyan: '#176b63', white: '#60717a', brightBlack: '#61717a',
+    brightRed: '#b32e43', brightGreen: '#226a42', brightYellow: '#805516',
+    brightBlue: '#245f93', brightMagenta: '#744494', brightCyan: '#12695f', brightWhite: '#263238'
+  }
+}
+const currentTerminalTheme = (): ITheme => terminalThemes[document.documentElement.dataset.theme === 'instrument' ? 'instrument' : 'ocean']
 
 type TerminalPanelProps = {
   target: { type: 'local' }
@@ -132,24 +150,13 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
       fontSize: 14,
       lineHeight: 1.25,
       scrollback: 8000,
-      theme: {
-        background: '#191b1d',
-        foreground: '#e2e5e8',
-        cursor: '#a7bed2',
-        selectionBackground: '#536a80aa',
-        black: '#0b1524',
-        red: '#ff6b7d',
-        green: '#67d391',
-        yellow: '#e9c46a',
-        blue: '#66a7ff',
-        magenta: '#c79cff',
-        cyan: '#64d8cb',
-        white: '#eef5ff'
-      }
+      theme: currentTerminalTheme()
     })
     const fit = new FitAddon()
     terminal.loadAddon(fit)
     terminal.open(containerRef.current!)
+    const themeObserver = new MutationObserver(() => { terminal.options.theme = currentTerminalTheme() })
+    themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] })
     fit.fit()
     terminal.focus()
     terminalRef.current = terminal
@@ -203,7 +210,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
       const lastLine = outputTailRef.current.split(/[\r\n]/).at(-1)?.trimEnd() ?? ''
       if (!/[$#>%❯➜›]\s*$/.test(lastLine)) return
       launchCommandSentRef.current = true
-      terminal.write(`\r\n\x1b[38;5;110m正在发送终端快捷命令…\x1b[0m\r\n`)
+      terminal.write(`\r\n\x1b[36m正在发送终端快捷命令…\x1b[0m\r\n`)
       window.labApi.terminal.write(sessionId, `${command}\r`)
     }
     const clearPasswordPrompt = (): void => {
@@ -233,7 +240,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
     })
     const detachExit = window.labApi.terminal.onExit((event) => {
       if (event.sessionId === sessionRef.current) {
-        terminal.write(`\r\n\x1b[38;5;244m${isLocal ? '本地进程已退出' : '连接已结束'}${event.code === null ? '' : `，退出码 ${event.code}`}\x1b[0m\r\n`)
+        terminal.write(`\r\n\x1b[90m${isLocal ? '本地进程已退出' : '连接已结束'}${event.code === null ? '' : `，退出码 ${event.code}`}\x1b[0m\r\n`)
         setStatus('offline')
         sessionRef.current = null
         canAutofillPasswordRef.current = false
@@ -261,6 +268,14 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
     })
     terminal.attachCustomKeyEventHandler((event) => {
       if (event.type !== 'keydown') return true
+      const pasteShortcut = ((event.ctrlKey || event.metaKey) && !event.altKey && event.code === 'KeyV')
+        || (event.shiftKey && !event.ctrlKey && !event.altKey && event.code === 'Insert')
+      if (pasteShortcut) {
+        event.preventDefault()
+        event.stopPropagation()
+        void pasteClipboard()
+        return false
+      }
       const copyShortcut = (event.ctrlKey && event.shiftKey && event.code === 'KeyC') || (event.ctrlKey && event.code === 'Insert')
       if (copyShortcut) {
         const selection = terminal.getSelection()
@@ -275,9 +290,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
       if (selection) {
         void window.labApi.clipboard.writeText(selection).then(() => showClipboardNotice('已复制到剪贴板'))
       } else {
-        void window.labApi.clipboard.readText().then((text) => {
-          if (text && sessionRef.current) window.labApi.terminal.write(sessionRef.current, text)
-        })
+        void pasteClipboard()
       }
       terminal.focus()
     }
@@ -306,6 +319,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
       input.dispose()
       containerRef.current?.removeEventListener('contextmenu', handleContextMenu)
       resizeObserver.disconnect()
+      themeObserver.disconnect()
       if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current)
       terminal.dispose()
       terminalRef.current = null
@@ -352,9 +366,9 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
   const connectTerminal = async (terminal: Terminal): Promise<void> => {
     setStatus('connecting')
     if (isLocal) {
-      terminal.write('\x1b[38;5;110m正在启动本地 PowerShell…\x1b[0m\r\n')
+      terminal.write('\x1b[36m正在启动本地 PowerShell…\x1b[0m\r\n')
     } else {
-      terminal.write(`\x1b[38;5;110m正在连接 ${route!.username}@${route!.host}:${route!.port}（${route!.name}）…\x1b[0m\r\n`)
+      terminal.write(`\x1b[36m正在连接 ${route!.username}@${route!.host}:${route!.port}（${route!.name}）…\x1b[0m\r\n`)
     }
     let result = isLocal
       ? await window.labApi.terminal.connectLocal(terminal.cols, terminal.rows)
@@ -418,10 +432,19 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
   }
 
   const pasteClipboard = async (): Promise<void> => {
-    const text = await window.labApi.clipboard.readText()
-    if (text && sessionRef.current) {
-      window.labApi.terminal.write(sessionRef.current, text)
-      showClipboardNotice('已粘贴')
+    const terminal = terminalRef.current
+    const sessionId = sessionRef.current
+    if (!terminal || !sessionId) return
+    try {
+      const text = await window.labApi.clipboard.readText()
+      if (text && terminalRef.current === terminal && sessionRef.current === sessionId) {
+        // xterm normalizes line endings and honors the shell's bracketed paste mode.
+        // Sending through onData also keeps password and working-directory tracking active.
+        terminal.paste(text)
+        showClipboardNotice('已粘贴')
+      }
+    } catch {
+      showClipboardNotice('读取剪贴板失败，请重试')
     }
     terminalRef.current?.focus()
   }
@@ -452,7 +475,7 @@ export function TerminalPanel(props: TerminalPanelProps): React.JSX.Element {
         </div>
         <div className="toolbar-actions">
           {!embedded && <button className="toolbar-button terminal-clipboard-button" onClick={() => void copySelection()} title="复制选中内容（Ctrl+Shift+C）"><Copy size={14} />复制</button>}
-          {!embedded && <button className="toolbar-button terminal-clipboard-button" onClick={() => void pasteClipboard()} title="粘贴（Ctrl+Shift+V）"><ClipboardPaste size={14} />粘贴</button>}
+          {!embedded && <button className="toolbar-button terminal-clipboard-button" onClick={() => void pasteClipboard()} title="粘贴多行文本（Ctrl+V / Ctrl+Shift+V / Shift+Insert）"><ClipboardPaste size={14} />粘贴</button>}
           <button className="toolbar-button" onClick={reconnect}><RefreshCw size={15} />{isLocal ? '重新启动' : '重连'}</button>
           {!embedded && <button className="icon-button" onClick={() => setMaximized((value) => !value)} title={maximized ? '还原窗口' : '最大化终端'}><Maximize2 size={17} /></button>}
           {!embedded && <button className="icon-button" onClick={onClose} title="关闭终端"><X size={18} /></button>}

@@ -184,7 +184,7 @@ function createWindow(store: AppStore): void {
           }
           const forcedTheme = process.env.LAB_DEMO_CAPTURE_THEME
           if (forcedTheme && view !== 'settings') {
-            const theme = forcedTheme === '浅色仪器台' ? 'instrument' : forcedTheme === '深色机房' ? 'machineRoom' : 'ocean'
+            const theme = ['浅色工作台', '浅色仪器台'].includes(forcedTheme) ? 'instrument' : 'ocean'
             await mainWindow?.webContents.executeJavaScript(
               `document.documentElement.dataset.theme = ${JSON.stringify(theme)}`
             )

@@ -2,7 +2,7 @@ export type AuthType = 'password' | 'privateKey'
 export type ServerMode = 'real' | 'demo'
 export type ServerStatus = 'online' | 'offline' | 'warning' | 'unknown'
 export type MonitorPolicy = 'manual' | 'onView' | 'background'
-export type AppTheme = 'ocean' | 'instrument' | 'machineRoom'
+export type AppTheme = 'ocean' | 'instrument'
 export type CloseBehavior = 'ask' | 'tray' | 'exit'
 export type AccessRouteKind = 'direct' | 'jump'
 
