@@ -14,10 +14,13 @@ import { TerminalManager } from './terminal-manager'
 import { VsCodeService } from './vscode-service'
 import { CondaService } from './conda-service'
 import { ExperimentScheduler } from './experiment-scheduler'
+import { TunnelManager } from './tunnel-manager'
+import type { TunnelConfigInput } from '../shared/types'
 
 let mainWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let terminalManager: TerminalManager | null = null
+let tunnelManager: TunnelManager | null = null
 let monitorService: MonitorService | null = null
 let experimentScheduler: ExperimentScheduler | null = null
 const sftpWindows = new Map<string, BrowserWindow>()
@@ -59,7 +62,7 @@ function hideToTray(): void {
     trayHintShown = true
     tray.displayBalloon({
       title: 'LabDeck 仍在后台运行',
-      content: '服务器监控与 GPU 空闲提醒将继续运行，双击托盘图标可恢复窗口。',
+      content: '服务器监控、SSH 隧道与 GPU 空闲提醒将继续运行，双击托盘图标可恢复窗口。',
       icon: appIconPath
     })
   }
@@ -406,6 +409,11 @@ function registerIpc(store: AppStore): void {
   const vscode = new VsCodeService(store)
   const conda = new CondaService(ssh)
   terminalManager = new TerminalManager(ssh, () => mainWindow?.webContents ?? null)
+  const tunnels = new TunnelManager(store, ssh, () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('tunnels:changed')
+  })
+  tunnelManager = tunnels
+  void tunnels.autoStart().catch(error => console.error('自动启动隧道失败：', error))
   experimentScheduler = new ExperimentScheduler(store, ssh, monitor, conda, () => {
     if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('experiments:changed')
   })
@@ -441,16 +449,20 @@ function registerIpc(store: AppStore): void {
   ipcMain.handle('servers:list', () => store.listServers())
   ipcMain.handle('servers:save', async (_event, input: ServerProfileInput) => {
     const saved = await store.saveServer(input)
+    tunnels.stopForServer(saved.id)
     monitor.invalidateServer(saved.id)
     return saved
   })
   ipcMain.handle('servers:mergeAccessRoute', async (_event, serverId: string, sourceServerId: string) => {
     const merged = await sshConfig.mergeAccessRoute(serverId, sourceServerId)
+    tunnels.stopForServer(serverId)
+    tunnels.stopForServer(sourceServerId)
     monitor.invalidateServer(serverId)
     monitor.invalidateServer(sourceServerId)
     return merged
   })
   ipcMain.handle('servers:remove', async (_event, id: string) => {
+    tunnels.stopForServer(id)
     await store.removeServer(id)
     monitor.invalidateServer(id)
   })
@@ -626,6 +638,23 @@ function registerIpc(store: AppStore): void {
     return conda.buildEnvironmentCommand(config, updateExisting)
   })
 
+  ipcMain.handle('tunnels:list', () => tunnels.list())
+  ipcMain.handle('tunnels:save', async (_event, input: TunnelConfigInput) => {
+    tunnels.assertEditable(input?.id)
+    const saved = await store.saveTunnel(input)
+    tunnels.forget(saved.id)
+    return tunnels.list().find(item => item.id === saved.id)
+  })
+  ipcMain.handle('tunnels:remove', async (_event, id: string) => {
+    tunnels.stop(id)
+    await store.removeTunnel(id)
+    tunnels.forget(id)
+  })
+  ipcMain.handle('tunnels:start', (_event, id: string) => tunnels.start(id))
+  ipcMain.handle('tunnels:stop', (_event, id: string) => tunnels.stop(id))
+  ipcMain.handle('tunnels:checkTarget', (_event, id: string) => tunnels.checkTarget(id))
+  ipcMain.handle('tunnels:openBrowser', (_event, id: string) => shell.openExternal(tunnels.browserUrl(id)))
+
   ipcMain.handle('settings:get', () => store.getSettings())
   ipcMain.handle('settings:save', async (_event, settings: AppSettings) => {
     const previous = store.getSettings()
@@ -654,6 +683,7 @@ app.whenReady().then(async () => {
 })
 
 app.on('before-quit', (event) => {
+  tunnelManager?.closeAll()
   experimentScheduler?.stop()
   monitorService?.closeAll()
   if (quittingAfterTerminalCleanup || !terminalManager) return

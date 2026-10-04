@@ -2658,6 +2658,42 @@ button:focus-visible, input:focus-visible, select:focus-visible { outline: 2px s
 .danger-button:hover { background: #c34855; }
 .danger-button:focus-visible,
 .app-modal button:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 2px; }
+
+.tunnel-page { min-width: 0; }
+.tunnel-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 18px; padding: 0 0 18px; color: var(--muted); font-size: 12px; }
+.tunnel-toolbar label { display: flex; align-items: center; gap: 10px; }
+.tunnel-toolbar select { max-width: 220px; padding: 7px 10px; color: var(--text); background: var(--panel); border: 1px solid var(--border-soft); border-radius: 5px; }
+.tunnel-toolbar small { margin-left: auto; font-size: 11px; }
+.tunnel-table { min-width: 780px; }
+.tunnel-table td { vertical-align: top; }
+.tunnel-table td:first-child { min-width: 145px; }
+.tunnel-mapping { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; max-width: 440px; overflow-wrap: anywhere; font-size: 12px; }
+.tunnel-mapping svg { flex-shrink: 0; color: var(--muted); }
+.tunnel-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.tunnel-error { display: block; max-width: 290px; margin-top: 7px; color: var(--red); font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; }
+.tunnel-empty { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; padding: 42px 24px; border-top: 1px solid var(--border-soft); }
+.tunnel-empty > svg { color: var(--accent-text); }
+.tunnel-empty h2 { margin: 0; font-size: 18px; }
+.tunnel-empty p { margin: 0 0 8px; color: var(--muted); font-size: 13px; line-height: 1.7; }
+.tunnel-editor { width: min(780px, calc(100vw - 40px)); max-height: calc(100vh - 48px); display: flex; flex-direction: column; }
+.tunnel-editor-body { padding: 22px 24px; overflow: auto; min-height: 0; }
+.tunnel-editor > .app-modal-footer { padding: 16px 24px; }
+.tunnel-editor fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.tunnel-templates { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+.tunnel-templates button { height: 30px; padding: 0 12px; border-radius: 5px; font-size: 11px; }
+.tunnel-diagram { display: grid; grid-template-columns: minmax(0, 1fr) 18px minmax(0, 1fr) 18px minmax(0, 1fr); gap: 12px; align-items: center; padding: 18px 12px; margin: 18px 0; background: var(--accent-surface); border-radius: 6px; }
+.tunnel-diagram > div { min-width: 0; display: flex; flex-direction: column; gap: 7px; }
+.tunnel-diagram small, .tunnel-diagram span { color: var(--muted); font-size: 11px; }
+.tunnel-diagram strong { color: var(--text); font-size: 12px; overflow-wrap: anywhere; }
+.tunnel-diagram > svg { color: var(--accent-text); }
+.tunnel-advanced { border-top: 1px solid var(--border-soft); margin-top: 18px; padding-top: 14px; }
+.tunnel-advanced summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+.tunnel-advanced .form-grid { margin-top: 16px; }
+.tunnel-check { display: flex; align-items: center; gap: 8px; margin-top: 12px; color: var(--text); font-size: 12px; }
+.tunnel-check input { accent-color: var(--accent-text); }
+.workbench-statusbar .status-tunnel-button { display: inline-flex; align-items: center; gap: 5px; padding: 0; border: 0; color: var(--muted); background: transparent; cursor: pointer; font-size: inherit; }
+.status-tunnel-button:focus-visible { outline: 2px solid var(--accent-text); outline-offset: 3px; }
+@media (max-width: 1100px) { .tunnel-toolbar small { width: 100%; margin-left: 0; } }
 :root[data-theme="instrument"] .app-modal-overlay { background: rgba(29, 45, 52, .38); }
 :root[data-theme="instrument"] .app-modal .dialog-icon.danger { color: #a53f47; background: #f3dfe1; }
 :root[data-theme="instrument"] .danger-button { color: #fff; background: #a53f47; border-color: #92363e; }

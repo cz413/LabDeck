@@ -5,6 +5,8 @@ import { dirname, join } from 'node:path'
 import type { AppSettings, ExperimentRun, ExperimentRunFinishInput, ExperimentRunStartInput, ExperimentTask, ExperimentTaskDraft, ExperimentTaskStatus, GpuHistoryPoint, GpuHistoryRange, JumpHostConfig, ServerAccessRoute, ServerProfile, ServerProfileInput, ServerSnapshot } from '../shared/types'
 import { appSettingsSchema, experimentRunFinishInputSchema, experimentRunStartInputSchema, experimentTaskDraftSchema, experimentTaskSchema, experimentTaskStatusSchema, serverProfileInputSchema } from '../shared/schemas'
 import { getAccessRoutes } from '../shared/access-routes'
+import type { TunnelConfig, TunnelConfigInput } from '../shared/types'
+import { tunnelConfigInputSchema, tunnelConfigSchema } from '../shared/schemas'
 
 interface PersistedData {
   version: number
@@ -14,6 +16,7 @@ interface PersistedData {
   gpuHistory: Record<string, GpuHistoryPoint[]>
   lastSnapshots: Record<string, ServerSnapshot>
   experimentTasks: ExperimentTask[]
+  tunnels: TunnelConfig[]
 }
 
 const MAX_GPU_HISTORY_POINTS = 2880
@@ -133,7 +136,11 @@ export class AppStore {
         }),
         gpuHistory: parsed.gpuHistory ?? {},
         lastSnapshots: parsed.lastSnapshots ?? {},
-        experimentTasks: parseExperimentTasks(parsed.experimentTasks)
+        experimentTasks: parseExperimentTasks(parsed.experimentTasks),
+        tunnels: Array.isArray(parsed.tunnels) ? parsed.tunnels.flatMap(value => {
+          const result = tunnelConfigSchema.safeParse(value)
+          return result.success ? [result.data] : []
+        }) : []
       }
       if (migratePollingInterval) await this.persist()
     } catch (error) {
@@ -148,7 +155,8 @@ export class AppStore {
         settings: defaultSettings,
         gpuHistory: {},
         lastSnapshots: {},
-        experimentTasks: []
+        experimentTasks: [],
+        tunnels: []
       }
       await this.persist()
     }
@@ -156,6 +164,34 @@ export class AppStore {
 
   listServers(): ServerProfile[] {
     return structuredClone(this.ensureData().servers)
+  }
+
+  listTunnels(): TunnelConfig[] { return structuredClone(this.ensureData().tunnels) }
+
+  getTunnel(id: string): TunnelConfig {
+    const tunnel = this.ensureData().tunnels.find(item => item.id === id)
+    if (!tunnel) throw new Error('隧道不存在或已被删除')
+    return structuredClone(tunnel)
+  }
+
+  async saveTunnel(rawInput: TunnelConfigInput): Promise<TunnelConfig> {
+    const input = tunnelConfigInputSchema.parse(rawInput)
+    const server = this.getServer(input.serverId)
+    if (server.mode !== 'real') throw new Error('隧道需要选择真实服务器')
+    if (!getAccessRoutes(server).some(route => route.id === input.accessRouteId)) throw new Error('连接路径不存在，请重新选择')
+    const data = this.ensureData()
+    const previous = input.id ? this.getTunnel(input.id) : undefined
+    if (!previous && data.tunnels.length >= 100) throw new Error('最多保存 100 条隧道')
+    const config: TunnelConfig = { ...input, id: previous?.id ?? randomUUID(), createdAt: previous?.createdAt ?? now(), updatedAt: now() }
+    data.tunnels = [...data.tunnels.filter(item => item.id !== config.id), config]
+    await this.persist()
+    return structuredClone(config)
+  }
+
+  async removeTunnel(id: string): Promise<void> {
+    this.getTunnel(id)
+    this.ensureData().tunnels = this.ensureData().tunnels.filter(item => item.id !== id)
+    await this.persist()
   }
 
   getServer(id: string): ServerProfile {
@@ -284,6 +320,7 @@ export class AppStore {
   async removeServer(id: string): Promise<void> {
     const data = this.ensureData()
     data.servers = data.servers.filter((item) => item.id !== id)
+    data.tunnels = data.tunnels.filter(item => item.serverId !== id)
     delete data.secrets[id]
     delete data.lastSnapshots[id]
     data.settings.gpuWatches = data.settings.gpuWatches.filter((watch) => watch.serverId !== id)
@@ -362,6 +399,7 @@ export class AppStore {
     }
     data.servers[baseIndex] = mergedProfile
     data.servers.splice(sourceIndex, 1)
+    data.tunnels = data.tunnels.map(tunnel => tunnel.serverId === source.id ? { ...tunnel, serverId: base.id, accessRouteId: mergedRoute.id, updatedAt: now() } : tunnel)
     delete data.secrets[source.id]
     delete data.lastSnapshots[source.id]
     data.settings.gpuWatches = data.settings.gpuWatches.filter((watch) => watch.serverId !== source.id)

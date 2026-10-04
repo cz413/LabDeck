@@ -70,6 +70,20 @@ const api: AppApi = {
       return () => ipcRenderer.removeListener('terminal:exit', handler)
     }
   },
+  tunnels: {
+    list: () => ipcRenderer.invoke('tunnels:list'),
+    save: input => ipcRenderer.invoke('tunnels:save', input),
+    remove: id => ipcRenderer.invoke('tunnels:remove', id),
+    start: id => ipcRenderer.invoke('tunnels:start', id),
+    stop: id => ipcRenderer.invoke('tunnels:stop', id),
+    checkTarget: id => ipcRenderer.invoke('tunnels:checkTarget', id),
+    openBrowser: id => ipcRenderer.invoke('tunnels:openBrowser', id),
+    onChanged: listener => {
+      const handler = (): void => listener()
+      ipcRenderer.on('tunnels:changed', handler)
+      return () => ipcRenderer.removeListener('tunnels:changed', handler)
+    }
+  },
   sftp: {
     openWindow: (serverId: string, accessRouteId?: string, initialPath?: string) => ipcRenderer.invoke('sftp:openWindow', serverId, accessRouteId, initialPath),
     onNavigate: (listener: (path: string) => void) => {

@@ -94,6 +94,11 @@ let tasks = ['running', 'queued', 'cancelled', 'failed'].map((status, index) => 
 const preview = { terminalConnects: 0, terminalCloses: 0, startedRuns: [] as unknown[], sftpReads: [] as unknown[], offlineServers: [] as string[], cachedServers: [] as string[] }
 Object.assign(window, { __labPreview: preview })
 const taskListeners = new Set<() => void>()
+const tunnelListeners = new Set<() => void>()
+let tunnels: Array<Record<string, unknown> & { id: string }> = [
+  { id: 'preview-jupyter', name: 'Jupyter', serverId: servers[0].id, accessRouteId: 'direct', type: 'local', bindAddress: '127.0.0.1', bindPort: 8888, targetHost: '127.0.0.1', targetPort: 8888, browserProtocol: 'http', autoReconnect: true, autoStart: false, createdAt: iso(), updatedAt: iso(), status: 'running', serviceStatus: 'unknown', connectionCount: 0, message: '' },
+  { id: 'preview-tensorboard', name: 'TensorBoard', serverId: servers[1].id, accessRouteId: 'direct', type: 'local', bindAddress: '127.0.0.1', bindPort: 16006, targetHost: '127.0.0.1', targetPort: 6006, browserProtocol: 'http', autoReconnect: true, autoStart: false, createdAt: iso(), updatedAt: iso(), status: 'stopped', serviceStatus: 'unknown', connectionCount: 0, message: '' }
+]
 const dataListeners = new Set<(event: { sessionId: string; data: string }) => void>()
 const connect = async () => {
   const sessionId = `preview-${++preview.terminalConnects}`
@@ -128,6 +133,21 @@ const api = {
     write: () => undefined, autofillPassword: async () => false, resize: () => undefined,
     close: () => { preview.terminalCloses++ },
     onData: (listener: (event: { sessionId: string; data: string }) => void) => { dataListeners.add(listener); return () => { dataListeners.delete(listener) } }, onExit: noEvents
+  },
+  tunnels: {
+    list: async () => structuredClone(tunnels),
+    onChanged: (listener: () => void) => { tunnelListeners.add(listener); return () => { tunnelListeners.delete(listener) } },
+    save: async (input: Record<string, unknown>) => {
+      const saved = { ...input, id: String(input.id ?? `tunnel-${tunnels.length + 1}`), createdAt: iso(), updatedAt: iso(), status: 'stopped', serviceStatus: 'unknown', message: '', connectionCount: 0 }
+      tunnels = [...tunnels.filter(item => item.id !== saved.id), saved]
+      tunnelListeners.forEach(listener => listener())
+      return structuredClone(saved)
+    },
+    start: async (id: string) => { Object.assign(tunnels.find(item => item.id === id)!, { status: 'running' }); tunnelListeners.forEach(listener => listener()); return { status: 'started', message: '' } },
+    stop: async (id: string) => { Object.assign(tunnels.find(item => item.id === id)!, { status: 'stopped', connectionCount: 0 }); tunnelListeners.forEach(listener => listener()) },
+    remove: async (id: string) => { tunnels = tunnels.filter(item => item.id !== id); tunnelListeners.forEach(listener => listener()) },
+    checkTarget: async (id: string) => { Object.assign(tunnels.find(item => item.id === id)!, { serviceStatus: 'reachable' }); tunnelListeners.forEach(listener => listener()); return { reachable: true, message: '目标 TCP 端口可达' } },
+    openBrowser: async () => undefined
   },
   sftp: {
     openWindow: async () => undefined, onNavigate: noEvents,

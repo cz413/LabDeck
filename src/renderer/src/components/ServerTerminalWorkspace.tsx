@@ -1,6 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Code2, FolderOpen, Laptop, Plus, Server, SquareTerminal, X } from 'lucide-react'
+import { Code2, FolderOpen, Laptop, Network, Plus, Server, SquareTerminal, X } from 'lucide-react'
 import type { ServerProfile } from '@shared/types'
 import { getAccessRoute, getAccessRoutes } from '@shared/access-routes'
 import { TerminalPanel } from './TerminalPanel'
@@ -35,6 +35,7 @@ interface TerminalWorkspaceProps {
   onAddLocal(): void
   onClose(sessionId: string): void
   onOpenVsCode(server: ServerProfile, accessRouteId: string): void
+  onOpenTunnel(server: ServerProfile, accessRouteId: string): void
   vscodeConnectingId: string | null
   onOpenFiles(session: ServerTerminalSession): void
   onOpenServerFiles(server: ServerProfile, accessRouteId: string): void
@@ -54,6 +55,7 @@ export function ServerTerminalWorkspace({
   onAddLocal,
   onClose,
   onOpenVsCode,
+  onOpenTunnel,
   vscodeConnectingId,
   onOpenFiles,
   onOpenServerFiles,
@@ -251,6 +253,7 @@ export function ServerTerminalWorkspace({
               <span>{vscodeConnectingId === activeServerSession.server.id ? '连接中…' : 'VS Code'}</span>
             </button>
           )}
+          {activeServerSession && <button type="button" className="local-terminal-add" aria-label="为当前会话新建 SSH 隧道" onClick={() => onOpenTunnel(activeServerSession.server, activeServerSession.accessRouteId)}><Network size={15} /><span>隧道</span></button>}
           <button
             ref={filesButtonRef}
             type="button"

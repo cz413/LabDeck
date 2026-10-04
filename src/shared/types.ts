@@ -6,6 +6,35 @@ export type AppTheme = 'ocean' | 'instrument'
 export type CloseBehavior = 'ask' | 'tray' | 'exit'
 export type AccessRouteKind = 'direct' | 'jump'
 
+export interface TunnelConfig {
+  id: string
+  name: string
+  serverId: string
+  accessRouteId: string
+  type: 'local' | 'remote'
+  bindAddress: string
+  bindPort: number
+  targetHost: string
+  targetPort: number
+  browserProtocol: 'http' | 'https' | 'none'
+  autoReconnect: boolean
+  autoStart: boolean
+  createdAt: string
+  updatedAt: string
+}
+export type TunnelConfigInput = Omit<TunnelConfig, 'id' | 'createdAt' | 'updatedAt'> & { id?: string }
+export type TunnelStatus = 'stopped' | 'starting' | 'running' | 'reconnecting' | 'error'
+export interface TunnelView extends TunnelConfig {
+  status: TunnelStatus
+  serviceStatus: 'unknown' | 'reachable' | 'unreachable'
+  message: string
+  connectionCount: number
+  startedAt?: string
+}
+export type TunnelStartResult =
+  | { status: 'started' | 'failed'; message: string }
+  | { status: 'host-key-required'; fingerprint: string; hostKeyTarget: 'server' | 'jumpHost'; message: string }
+
 export interface JumpHostConfig {
   host: string
   port: number
@@ -396,6 +425,16 @@ export interface AppApi {
     close(sessionId: string): void
     onData(listener: (event: TerminalDataEvent) => void): () => void
     onExit(listener: (event: TerminalExitEvent) => void): () => void
+  }
+  tunnels: {
+    list(): Promise<TunnelView[]>
+    save(input: TunnelConfigInput): Promise<TunnelView>
+    remove(id: string): Promise<void>
+    start(id: string): Promise<TunnelStartResult>
+    stop(id: string): Promise<void>
+    checkTarget(id: string): Promise<{ reachable: boolean; message: string }>
+    openBrowser(id: string): Promise<void>
+    onChanged(listener: () => void): () => void
   }
   sftp: {
     openWindow(serverId: string, accessRouteId?: string, initialPath?: string): Promise<void>

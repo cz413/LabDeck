@@ -116,6 +116,10 @@ async function main() {
     await click('.workbench-modulebar > button', '告警'); await sample('alerts')
     await click('.workbench-modulebar .nav-button', '资源');
     await click('.wb-host-actions button', '打开文件'); await waitFor('document.querySelectorAll(".file-row").length === 2'); await sample('files')
+    await click('.workbench-modulebar .nav-button', 'SSH 隧道'); await sample('tunnels', true)
+    await click('.tunnel-page .workbench-page-heading button'); await sample('tunnel-editor', true)
+    await click('.tunnel-advanced summary'); await sample('tunnel-advanced', true)
+    await click('[aria-label="关闭隧道配置"]')
     await click('.workbench-browser-links button', '全部服务器'); await sample('servers')
     await click('.workbench-browser-links button', 'GPU 总览'); await sample('gpu-pool')
   }

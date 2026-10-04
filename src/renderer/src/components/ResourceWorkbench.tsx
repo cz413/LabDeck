@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Bell, Code2, FolderOpen, MoreHorizontal, Play, Plus, RefreshCw, SquareTerminal } from 'lucide-react'
+import { Bell, Code2, FolderOpen, MoreHorizontal, Network, Play, Plus, RefreshCw, SquareTerminal } from 'lucide-react'
 import type { ExperimentTask, GpuHistoryPoint, GpuHistoryRange, GpuMetric, GpuWatchTarget, ServerProfile, ServerSnapshot } from '@shared/types'
 import { getAccessRoute } from '@shared/access-routes'
 import { gpuLoadState, isGpuBusy } from '@shared/gpu-status'
@@ -19,6 +19,7 @@ interface ResourceWorkbenchProps {
   onAccessRouteChange(id: string): void
   onRefresh(): void
   onTerminal(): void
+  onTunnel(): void
   onFiles(path?: string): void
   onVsCode(): void
   onEdit(): void
@@ -92,7 +93,7 @@ export function ResourceWorkbench(props: ResourceWorkbenchProps): React.JSX.Elem
         {route.kind === 'jump' && route.jumpHost && <small title={`${route.jumpHost.username}@${route.jumpHost.host}:${route.jumpHost.port}`}>经 {route.jumpHost.host}:{route.jumpHost.port}</small>}
       </div>
       <div className="wb-host-metrics"><span>延迟 <strong>{snapshot?.latencyMs == null ? '—' : `${snapshot.latencyMs} ms`}</strong></span><span>运行 <strong>{snapshot?.uptimeSeconds == null ? '—' : `${Math.floor(snapshot.uptimeSeconds / 86400)} 天`}</strong></span></div>
-      <div className="wb-host-actions"><button className="secondary-button" onClick={props.onTerminal}><SquareTerminal size={14} />连接终端</button><button className="secondary-button" onClick={() => props.onFiles()}><FolderOpen size={14} />打开文件</button><button className="secondary-button" onClick={props.onVsCode} disabled={props.vscodeConnecting}><Code2 size={14} />{props.vscodeConnecting ? '连接中…' : 'VS Code'}</button></div>
+      <div className="wb-host-actions"><button className="secondary-button" onClick={props.onTunnel}><Network size={14} />SSH 隧道</button><button className="secondary-button" onClick={props.onTerminal}><SquareTerminal size={14} />连接终端</button><button className="secondary-button" onClick={() => props.onFiles()}><FolderOpen size={14} />打开文件</button><button className="secondary-button" onClick={props.onVsCode} disabled={props.vscodeConnecting}><Code2 size={14} />{props.vscodeConnecting ? '连接中…' : 'VS Code'}</button></div>
     </header>
     <section className="wb-host-summary" aria-label="服务器资源摘要"><div><span>CPU</span><strong>{pct(snapshot?.cpuUsagePercent)}</strong><i><b style={{ width: `${snapshot?.cpuUsagePercent ?? 0}%` }} /></i><small>负载 {snapshot?.loadAverage?.map(value => value.toFixed(2)).join(' / ') ?? '—'}</small></div><div><span>内存</span><strong>{gb(snapshot?.memoryUsedBytes)}<em>/ {gb(snapshot?.memoryTotalBytes)}</em></strong><i><b style={{ width: `${Math.min(100, memoryPercent)}%` }} /></i><small>{Math.round(memoryPercent)}% 已用</small></div><div><span>GPU 资源</span><strong>{live ? gpus.length - busyCount : '—'}<em>空闲 / {gpus.length} 张</em></strong><i><b style={{ width: `${gpus.length ? busyCount / gpus.length * 100 : 0}%` }} /></i><small>{live ? `${busyCount} 张使用中` : '等待实时状态确认'}</small></div><div><span>系统存储</span><strong>{pct(primaryDisk?.usagePercent)}</strong><i><b style={{ width: `${primaryDisk?.usagePercent ?? 0}%` }} /></i><small>{primaryDisk ? `${primaryDisk.mountPoint} · 可用 ${gb(primaryDisk.availableBytes)}` : '尚无存储数据'}</small></div></section>
     <nav className="wb-tabs" aria-label="服务器工作区" role="tablist">{([['gpu', 'GPU'], ['tasks', '任务'], ['connection', '连接与存储'], ['history', '历史']] as const).map(([value, label]) => <button key={value} role="tab" aria-selected={tab === value} onClick={() => setTab(value)}>{label}</button>)}<button className="wb-refresh" onClick={props.onRefresh} disabled={props.refreshing} aria-label="刷新当前服务器"><RefreshCw size={14} className={props.refreshing ? 'spin' : ''} /></button></nav>
@@ -116,6 +117,7 @@ export function ResourceWorkbench(props: ResourceWorkbenchProps): React.JSX.Elem
     </>}
     {tab === 'tasks' && <div className="wb-tab-content">{queue}</div>}
     {tab === 'connection' && <div className="wb-connection-grid">
+      <section><h3>SSH 隧道</h3><p className="wb-muted">转发 Jupyter、TensorBoard 或其他端口，沿用当前连接路径。</p><button className="secondary-button" onClick={props.onTunnel}><Network size={14} />新建隧道</button></section>
       <section><h3>SSH 连接</h3><AccessRouteSelect server={server} value={props.accessRouteId} onChange={props.onAccessRouteChange} /><dl><div><dt>目标地址</dt><dd>{route.host}:{route.port}</dd></div><div><dt>认证用户</dt><dd>{route.username}</dd></div><div><dt>认证方式</dt><dd>{route.authType === 'password' ? '密码' : '私钥'}</dd></div><div><dt>连接延迟</dt><dd>{snapshot?.latencyMs == null ? '—' : `${snapshot.latencyMs} ms`}</dd></div><div><dt>监控方式</dt><dd>{server.monitorPolicy === 'background' ? '持续监控' : server.monitorPolicy === 'onView' ? '查看时采集' : '手动采集'}</dd></div></dl><div className="wb-connection-actions"><button className="secondary-button" onClick={props.onTest} disabled={props.testing}>{props.testing ? '测试中…' : '测试连接'}</button><button className="secondary-button" onClick={props.onEdit}>编辑服务器</button><button className="wb-text-button" onClick={props.onMerge}>合并连接路径</button><button className="wb-text-button wb-danger" onClick={props.onRemove}>删除服务器</button></div></section>
       <section><h3>存储挂载</h3>{snapshot?.fileSystems.length ? <table className="wb-table"><thead><tr><th>挂载点</th><th>已用 / 总量</th><th>使用率</th></tr></thead><tbody>{snapshot.fileSystems.map((disk) => <tr key={`${disk.filesystem}:${disk.mountPoint}`}><td>{disk.mountPoint}</td><td>{gb(disk.usedBytes)} / {gb(disk.totalBytes)}</td><td className={disk.usagePercent >= 80 ? 'wb-warning' : ''}>{pct(disk.usagePercent)}</td></tr>)}</tbody></table> : <p className="wb-muted">尚无存储数据。</p>}</section>
     </div>}

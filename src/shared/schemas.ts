@@ -2,6 +2,24 @@ import { z } from 'zod'
 
 const hostSchema = z.string().trim().min(1).max(253)
 
+export const tunnelConfigInputSchema = z.object({
+  id: z.string().uuid().optional(),
+  name: z.string().trim().min(1).max(80),
+  serverId: z.string().uuid(),
+  accessRouteId: z.string().trim().min(1).max(80),
+  type: z.enum(['local', 'remote']),
+  bindAddress: z.union([z.ipv4(), z.ipv6()]).default('127.0.0.1'),
+  bindPort: z.number().int().min(1).max(65535),
+  targetHost: hostSchema.refine(value => !/[\s\x00-\x1f\x7f]/.test(value), '目标地址不能包含空白或控制字符'),
+  targetPort: z.number().int().min(1).max(65535),
+  browserProtocol: z.enum(['http', 'https', 'none']).default('http'),
+  autoReconnect: z.boolean().default(true),
+  autoStart: z.boolean().default(false)
+})
+export const tunnelConfigSchema = tunnelConfigInputSchema.extend({
+  id: z.string().uuid(), createdAt: z.string().datetime(), updatedAt: z.string().datetime()
+})
+
 const jumpHostSchema = z.object({
   host: hostSchema,
   port: z.number().int().min(1).max(65535),

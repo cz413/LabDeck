@@ -20,6 +20,7 @@ import {
   LayoutDashboard,
   ListTodo,
   MemoryStick,
+  Network,
   Minus,
   Pencil,
   Plus,
@@ -48,8 +49,10 @@ import { ConfirmDialog, type ConfirmationRequest } from './components/ConfirmDia
 import { ExperimentTaskPool } from './components/ExperimentTaskPool'
 import { ResourceWorkbench } from './components/ResourceWorkbench'
 import { SftpPanel } from './components/SftpPanel'
+import { TunnelPage, type TunnelRequest } from './components/TunnelPage'
+import type { TunnelView } from '@shared/types'
 
-type Page = 'gpus' | 'tasks' | 'servers' | 'serverDetail' | 'gpuDetail' | 'terminals' | 'files' | 'alerts' | 'settings'
+type Page = 'gpus' | 'tasks' | 'servers' | 'serverDetail' | 'gpuDetail' | 'terminals' | 'files' | 'tunnels' | 'alerts' | 'settings'
 type GpuSelection = { server: ServerProfile; gpuIndex: number } | null
 
 interface UserGpuTask {
@@ -125,6 +128,8 @@ export function App(): React.JSX.Element {
   const [page, setPage] = useState<Page>('serverDetail')
   const [servers, setServers] = useState<ServerProfile[]>([])
   const [experimentTasks, setExperimentTasks] = useState<ExperimentTask[]>([])
+  const [tunnels, setTunnels] = useState<TunnelView[]>([])
+  const [tunnelRequest, setTunnelRequest] = useState<TunnelRequest | null>(null)
   const [snapshots, setSnapshots] = useState<Record<string, ServerSnapshot>>({})
   const [search, setSearch] = useState('')
   const [loading, setLoading] = useState(true)
@@ -294,6 +299,14 @@ export function App(): React.JSX.Element {
       console.warn('刷新实验任务状态失败', error)
     })
   }), [])
+
+  const reloadTunnels = async (): Promise<void> => { setTunnels(await window.labApi.tunnels.list()) }
+  useEffect(() => {
+    const refresh = (): void => { void reloadTunnels().catch(error => console.warn('刷新隧道状态失败', error)) }
+    const unsubscribe = window.labApi.tunnels.onChanged(refresh)
+    refresh()
+    return unsubscribe
+  }, [])
 
   useEffect(() => {
     const watchedServerIds = new Set(settings.gpuWatches.map((watch) => watch.serverId))
@@ -749,6 +762,11 @@ export function App(): React.JSX.Element {
     setPage(nextPage)
   }
 
+  const openTunnel = (server: ServerProfile, accessRouteId: string): void => {
+    setTunnelRequest({ id: Date.now(), serverId: server.id, accessRouteId })
+    setPage('tunnels')
+  }
+
   function openGpu(server: ServerProfile, gpuIndex: number): void {
     if (page !== 'gpuDetail') gpuReturnPage.current = page
     setSelectedServerId(server.id)
@@ -801,6 +819,7 @@ export function App(): React.JSX.Element {
         <NavButton active={page === 'tasks'} icon={<ListTodo size={16} />} label="实验任务" onClick={() => goToPage('tasks')} />
         <NavButton active={page === 'terminals'} icon={<SquareTerminal size={16} />} label="终端" badge={terminalSessions.length || undefined} onClick={() => goToPage('terminals')} />
         <NavButton active={page === 'files'} icon={<FolderOpen size={16} />} label="文件" onClick={() => { if (selectedServer && fileTarget?.serverId !== selectedServer.id) openSftp(selectedServer); else goToPage('files') }} />
+        <NavButton active={page === 'tunnels'} icon={<Network size={16} />} label="SSH 隧道" badge={tunnels.filter(tunnel => ['running', 'starting', 'reconnecting'].includes(tunnel.status)).length || undefined} onClick={() => goToPage('tunnels')} />
         <label className="workbench-search"><Search size={14} /><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索服务器" aria-label="搜索服务器" /></label>
         <button className={page === 'alerts' ? 'active' : ''} onClick={() => goToPage('alerts')}><Bell size={15} />告警{alerts.length > 0 && <b>{alerts.length}</b>}</button>
         <button className={page === 'settings' ? 'active' : ''} onClick={() => goToPage('settings')}><Settings size={15} />设置</button>
@@ -831,7 +850,8 @@ export function App(): React.JSX.Element {
               onTest={() => void testServer(selectedServer)} onRemove={() => void removeServer(selectedServer)} onMerge={() => void mergeServerPath(selectedServer)}
               onTask={(task) => openTask(task)} onNewTask={(gpu) => openTask(undefined, gpu)} onGpuDetail={(gpuIndex) => openGpu(selectedServer, gpuIndex)}
               onToggleWatch={(gpuUuid) => void toggleGpuWatch({ serverId: selectedServer.id, gpuUuid })}
-            /> : <div className="workbench-welcome"><ServerIcon size={28} /><h1>还没有服务器</h1><p>导入 SSH Config 或添加服务器，查看 GPU 并调度实验。</p><button className="secondary-button" onClick={() => setDialogServer(null)}><Plus size={15} />添加服务器</button><button className="wb-text-button" onClick={() => void importSshConfig()}>导入 SSH Config</button></div>) : page === 'gpuDetail' && gpuSelection ? <GpuDetailPanel key={gpuSelection.server.id} server={servers.find(server => server.id === gpuSelection.server.id) ?? gpuSelection.server} snapshot={snapshots[gpuSelection.server.id]} initialGpuIndex={gpuSelection.gpuIndex} watches={settings.gpuWatches} accessRouteId={accessRouteIdFor(gpuSelection.server)} onToggleWatch={(gpuUuid) => void toggleGpuWatch({ serverId: gpuSelection.server.id, gpuUuid })} onClose={() => setPage(gpuReturnPage.current)} refreshing={refreshing} onRefresh={() => void refreshSnapshots([gpuSelection.server], { force: true })} onTerminal={() => openServerTerminal(gpuSelection.server)} onRun={(gpu) => openTask(undefined, gpu)} onSelectGpu={(gpuIndex) => setGpuSelection({ server: gpuSelection.server, gpuIndex })} /> : page === 'tasks' ? <><header className="workbench-page-heading"><h1>实验任务</h1><span>任务配置、排队与运行记录</span></header>{taskPool}</> : page === 'files' ? (fileServer && fileRouteId ? <div className="workbench-files"><div className="workbench-file-route"><AccessRouteSelect server={fileServer} value={fileRouteId} onChange={(id) => openSftp(fileServer, id)} /></div><SftpPanel key={`${fileServer.id}:${fileRouteId}`} server={fileServer} accessRouteId={fileRouteId} initialPath={filePath} onClose={() => goToPage('serverDetail')} onMessage={notify} /></div> : <div className="workbench-welcome"><FolderOpen size={28} /><h1>选择一台服务器</h1><p>从左侧服务器列表打开远程文件。</p></div>) : page === 'terminals' ? null : page === 'servers' ? <><header className="workbench-page-heading"><h1>全部服务器</h1><button className="secondary-button" onClick={() => void refreshSnapshots(servers, { force: true })}><RefreshCw size={14} className={refreshing ? 'spin' : ''} />刷新全部</button></header><ServerTable servers={filteredServers} snapshots={snapshots} testingId={testingId} vscodeConnectingId={vscodeConnectingId} accessRouteId={accessRouteIdFor} onAccessRouteChange={selectAccessRoute} onOverview={openServerDetail} onTest={testServer} onTerminal={openServerTerminal} onSftp={openSftp} onVsCode={(server) => void openVsCode(server)} onGpu={(server, gpuIndex) => openGpu(server, gpuIndex)} onEdit={(server) => setDialogServer(server)} onRemove={removeServer} onMerge={mergeServerPath} /></> : page === 'gpus' ? <GpuResourcePool servers={filteredServers} snapshots={snapshots} watches={settings.gpuWatches} refreshing={refreshing} onRefresh={() => void refreshSnapshots(servers, { force: true })} onToggleWatch={(target) => void toggleGpuWatch(target)} onSelect={openGpu} filters={gpuPoolFilters} onFiltersChange={setGpuPoolFilters} /> : page === 'alerts' ? <><header className="workbench-page-heading"><h1>告警</h1><span>{alerts.length} 条活动告警</span></header><AlertsPage alerts={alerts} /></> : <><header className="workbench-page-heading"><h1>设置</h1></header><SettingsPage settings={settings} onChange={setSettings} onSave={saveSettings} /></>}
+              onTunnel={() => openTunnel(selectedServer, accessRouteIdFor(selectedServer))}
+            /> : <div className="workbench-welcome"><ServerIcon size={28} /><h1>还没有服务器</h1><p>导入 SSH Config 或添加服务器，查看 GPU 并调度实验。</p><button className="secondary-button" onClick={() => setDialogServer(null)}><Plus size={15} />添加服务器</button><button className="wb-text-button" onClick={() => void importSshConfig()}>导入 SSH Config</button></div>) : page === 'gpuDetail' && gpuSelection ? <GpuDetailPanel key={gpuSelection.server.id} server={servers.find(server => server.id === gpuSelection.server.id) ?? gpuSelection.server} snapshot={snapshots[gpuSelection.server.id]} initialGpuIndex={gpuSelection.gpuIndex} watches={settings.gpuWatches} accessRouteId={accessRouteIdFor(gpuSelection.server)} onToggleWatch={(gpuUuid) => void toggleGpuWatch({ serverId: gpuSelection.server.id, gpuUuid })} onClose={() => setPage(gpuReturnPage.current)} refreshing={refreshing} onRefresh={() => void refreshSnapshots([gpuSelection.server], { force: true })} onTerminal={() => openServerTerminal(gpuSelection.server)} onRun={(gpu) => openTask(undefined, gpu)} onSelectGpu={(gpuIndex) => setGpuSelection({ server: gpuSelection.server, gpuIndex })} /> : page === 'tunnels' ? <TunnelPage tunnels={tunnels} servers={servers} request={tunnelRequest} onRequestHandled={() => setTunnelRequest(null)} onChanged={reloadTunnels} onTrusted={async () => { await loadServers() }} notify={notify} confirm={requestConfirmation} /> : page === 'tasks' ? <><header className="workbench-page-heading"><h1>实验任务</h1><span>任务配置、排队与运行记录</span></header>{taskPool}</> : page === 'files' ? (fileServer && fileRouteId ? <div className="workbench-files"><div className="workbench-file-route"><AccessRouteSelect server={fileServer} value={fileRouteId} onChange={(id) => openSftp(fileServer, id)} /></div><SftpPanel key={`${fileServer.id}:${fileRouteId}`} server={fileServer} accessRouteId={fileRouteId} initialPath={filePath} onClose={() => goToPage('serverDetail')} onMessage={notify} /></div> : <div className="workbench-welcome"><FolderOpen size={28} /><h1>选择一台服务器</h1><p>从左侧服务器列表打开远程文件。</p></div>) : page === 'terminals' ? null : page === 'servers' ? <><header className="workbench-page-heading"><h1>全部服务器</h1><button className="secondary-button" onClick={() => void refreshSnapshots(servers, { force: true })}><RefreshCw size={14} className={refreshing ? 'spin' : ''} />刷新全部</button></header><ServerTable servers={filteredServers} snapshots={snapshots} testingId={testingId} vscodeConnectingId={vscodeConnectingId} accessRouteId={accessRouteIdFor} onAccessRouteChange={selectAccessRoute} onOverview={openServerDetail} onTest={testServer} onTerminal={openServerTerminal} onSftp={openSftp} onVsCode={(server) => void openVsCode(server)} onGpu={(server, gpuIndex) => openGpu(server, gpuIndex)} onEdit={(server) => setDialogServer(server)} onRemove={removeServer} onMerge={mergeServerPath} /></> : page === 'gpus' ? <GpuResourcePool servers={filteredServers} snapshots={snapshots} watches={settings.gpuWatches} refreshing={refreshing} onRefresh={() => void refreshSnapshots(servers, { force: true })} onToggleWatch={(target) => void toggleGpuWatch(target)} onSelect={openGpu} filters={gpuPoolFilters} onFiltersChange={setGpuPoolFilters} /> : page === 'alerts' ? <><header className="workbench-page-heading"><h1>告警</h1><span>{alerts.length} 条活动告警</span></header><AlertsPage alerts={alerts} /></> : <><header className="workbench-page-heading"><h1>设置</h1></header><SettingsPage settings={settings} onChange={setSettings} onSave={saveSettings} /></>}
           </div>
           <TerminalDock expanded={showTerminal} fullscreen={page === 'terminals'}>
             <header className="workbench-dock-heading"><button onClick={() => { if (page === 'terminals') { setPage(terminalReturnPage.current); setTerminalDockOpen(false) } else setTerminalDockOpen((open) => !open) }} aria-expanded={showTerminal} title={showTerminal ? '收起终端，会话继续运行' : '展开终端'}><SquareTerminal size={13} />终端<span>{terminalSessions.length ? `${terminalSessions.length} 个会话` : '未打开会话'}</span>{showTerminal ? <ChevronDown size={13} /> : <ChevronUp size={13} />}</button><div>{showTerminal && (page === 'terminals' ? <button onClick={() => { setPage(terminalReturnPage.current); setTerminalDockOpen(true) }} aria-label="返回底部终端" title="返回底部终端"><Copy size={12} />返回底部</button> : <button onClick={() => goToPage('terminals')} aria-label="全屏终端" title="展开到完整终端页"><Square size={12} />展开终端</button>)}<button onClick={addLocalTerminalSession}><Plus size={13} />本地终端</button></div></header>
@@ -839,13 +859,14 @@ export function App(): React.JSX.Element {
               sessions={terminalSessions} activeId={activeTerminalSessionId} visible={showTerminal} servers={servers} accessRouteIdFor={accessRouteIdFor}
               onActivate={setActiveTerminalSessionId} onAdd={addTerminalSession} onAddLocal={addLocalTerminalSession} onClose={closeTerminalSession}
               onOpenVsCode={(server, routeId) => void openVsCode(server, routeId)} vscodeConnectingId={vscodeConnectingId}
+              onOpenTunnel={openTunnel}
               onOpenFiles={(session) => openSftp(servers.find((server) => server.id === session.server.id) ?? session.server, session.accessRouteId, session.currentPath)}
               onOpenServerFiles={openSftp} onWorkingDirectory={updateTerminalWorkingDirectory} onTrusted={async () => { await loadServers() }} confirm={requestConfirmation}
             />
           </TerminalDock>
         </main>
       </div>
-      <footer className="workbench-statusbar"><span><i className={settings.monitoringEnabled ? 'on' : ''} />{settings.monitoringEnabled ? '监控已启用' : '监控已关闭'}<span>{terminalSessions.length} 个终端会话</span></span><span>{refreshing ? '正在采集…' : selectedServer && snapshots[selectedServer.id] ? `最近采集 ${new Date(snapshots[selectedServer.id].sampledAt).toLocaleTimeString('zh-CN')}` : '尚未采集'}<span>间隔 {settings.pollingIntervalSeconds} 秒</span></span></footer>
+      <footer className="workbench-statusbar"><span><i className={settings.monitoringEnabled ? 'on' : ''} />{settings.monitoringEnabled ? '监控已启用' : '监控已关闭'}<span>{terminalSessions.length} 个终端会话</span><button className="status-tunnel-button" onClick={() => goToPage('tunnels')}><Network size={12} />隧道 {tunnels.filter(tunnel => ['running', 'starting', 'reconnecting'].includes(tunnel.status)).length}</button></span><span>{refreshing ? '正在采集…' : selectedServer && snapshots[selectedServer.id] ? `最近采集 ${new Date(snapshots[selectedServer.id].sampledAt).toLocaleTimeString('zh-CN')}` : '尚未采集'}<span>间隔 {settings.pollingIntervalSeconds} 秒</span></span></footer>
 
       {dialogServer !== undefined && <ServerDialog server={dialogServer} onClose={() => setDialogServer(undefined)} onSaved={(server) => void saved(server)} />}
 

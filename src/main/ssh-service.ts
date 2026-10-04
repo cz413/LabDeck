@@ -238,6 +238,13 @@ export class SshService {
               )
             )
           } else reject(error)
+          client.destroy()
+        })
+        .once('close', () => {
+          if (!settled) {
+            settled = true
+            reject(new Error('SSH 连接在认证完成前关闭'))
+          }
         })
         .connect({
           ...config,
